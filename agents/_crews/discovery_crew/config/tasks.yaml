@@ -1,0 +1,29 @@
+interview_task:
+  description: >
+    You are interviewing the campaign owner to understand their marketing needs.
+
+    Campaign brief: {campaign_brief}
+
+    Previous Q&A:
+    {qa_history}
+
+    Current round: {discovery_rounds} of max 4.
+
+    Your job:
+    - If you have enough information about: target audience, core selling points,
+      budget range, and timeline — output exactly [READY] followed by a summary
+      of audience profile and market insights.
+    - Otherwise, ask ONE focused question. Keep it concise (1-2 sentences).
+      Do NOT ask multiple questions at once.
+      After your question, add a line "[SUGGESTIONS]" followed by 2-3 example
+      answers the user might give, each on its own line prefixed with "- ".
+      These should be realistic, diverse options relevant to your question.
+
+    Language: Respond in {locale_instruction}.
+  expected_output: >
+    Either:
+    A) A single focused question (1-2 sentences) followed by [SUGGESTIONS] and
+       2-3 example answers (each prefixed with "- "), OR
+    B) [READY] followed by a structured summary containing audience profile
+       and market insights.
+  agent: market_analyst

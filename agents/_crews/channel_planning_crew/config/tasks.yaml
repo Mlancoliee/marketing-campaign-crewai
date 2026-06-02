@@ -1,0 +1,21 @@
+channel_strategy_task:
+  description: >
+    Design the channel strategy for this marketing campaign.
+
+    Campaign: {campaign_name}
+    Brief: {campaign_brief}
+    Audience Profile: {audience_profile}
+    Market Insights: {market_insights}
+
+    Provide:
+    1. Channel Mix - which channels to use and why
+    2. Channel Roles - what each channel is responsible for (awareness, consideration, conversion, retention)
+    3. Timeline - campaign phases and timing (preparation, launch, sustain, wrap-up)
+    4. Budget Allocation - percentage split across channels with brief rationale
+
+    Be specific and actionable. Use tables where helpful.
+    Language: Respond in {locale_instruction}.
+  expected_output: >
+    A structured channel strategy containing channel mix with rationale,
+    role of each channel, campaign timeline with phases, and budget allocation.
+  agent: channel_planner

@@ -1,0 +1,24 @@
+copywriting_task:
+  description: >
+    Write marketing copy based on the approved campaign strategy.
+
+    Campaign: {campaign_name}
+    Integrated Strategy:
+    {integrated_strategy}
+
+    Selected Creative Concept:
+    {selected_creative}
+
+    Produce:
+    1. Main Headline - attention-grabbing, max 10 words
+    2. Sub-headline - supporting message, max 20 words
+    3. Body Copy - 2-3 paragraphs, persuasive and on-brand
+    4. Call-to-Action (CTA) - clear, action-oriented, max 5 words
+    5. Social Media Variants - 2-3 short-form versions for different platforms
+
+    Match the tone and personality of the creative concept.
+    Language: Respond in {locale_instruction}.
+  expected_output: >
+    Complete marketing copy package with main headline, sub-headline, body copy,
+    CTA, and 2-3 social media variants.
+  agent: copywriter

@@ -1,0 +1,24 @@
+creative_concepts_task:
+  description: >
+    Based on the following campaign context, develop 2-3 distinct creative concepts.
+
+    Campaign: {campaign_name}
+    Brief: {campaign_brief}
+    Audience Profile: {audience_profile}
+    Market Insights: {market_insights}
+
+    For EACH concept, provide:
+    1. Concept Name (short, memorable)
+    2. Core Idea (2-3 sentences describing the creative direction)
+    3. Slogan (one catchy tagline)
+    4. Visual Direction (describe the look and feel, color palette mood, imagery style)
+    5. Key Differentiator (why this concept stands out)
+
+    Make sure concepts differ MEANINGFULLY - not just surface-level variations.
+
+    Output as a numbered list of concepts.
+    Language: Respond in {locale_instruction}.
+  expected_output: >
+    2-3 distinct creative concepts, each with name, core idea, slogan,
+    visual direction, and key differentiator.
+  agent: brand_creative_director

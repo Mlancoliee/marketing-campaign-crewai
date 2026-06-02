@@ -1,0 +1,26 @@
+integrate_task:
+  description: >
+    Integrate the selected creative concept and channel strategy into a unified
+    marketing campaign plan.
+
+    Campaign: {campaign_name}
+    Audience Profile: {audience_profile}
+
+    Selected Creative Concept:
+    {selected_creative}
+
+    Channel Strategy:
+    {channel_plan}
+
+    Your job:
+    - Synthesize creative direction and channel plan into ONE cohesive strategy
+    - Resolve any tensions between creative needs and budget constraints
+    - Add campaign objectives, key messages per channel, success metrics (KPIs)
+    - Keep it actionable - this is the master plan the team will execute from
+
+    Language: Respond in {locale_instruction}.
+  expected_output: >
+    A unified marketing strategy document containing campaign objectives,
+    target audience summary, creative direction, key messages, channel plan,
+    timeline, budget, and KPIs.
+  agent: chief_strategist

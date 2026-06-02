@@ -1,0 +1,229 @@
+@import url('https://fonts.googleapis.com/css2?family=Open+Sans:wght@300;400;500;600;700&family=Poppins:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+:root {
+  --color-primary: #7C3AED;
+  --color-primary-light: #A78BFA;
+  --color-primary-dark: #5B21B6;
+  --color-cta: #F97316;
+  --color-cta-hover: #EA580C;
+  --color-bg: #FAF5FF;
+  --color-bg-card: #FFFFFF;
+  --color-text: #1E1B4B;
+  --color-text-muted: #6B7280;
+  --color-border: #E9D5FF;
+  --color-success: #10B981;
+  --color-warning: #F59E0B;
+  --color-error: #EF4444;
+
+  --font-heading: 'Poppins', sans-serif;
+  --font-body: 'Open Sans', sans-serif;
+
+  --radius: 12px;
+  --radius-sm: 8px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-body);
+  background: var(--color-bg);
+  color: var(--color-text);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading);
+}
+
+/* Phase Progress */
+.phase-node {
+  transition: all 0.2s ease;
+}
+.phase-node.active {
+  color: var(--color-primary);
+  font-weight: 600;
+}
+.phase-node.completed {
+  color: var(--color-success);
+}
+
+/* Card styles */
+.card {
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.card:hover {
+  border-color: var(--color-primary-light);
+}
+.card.active {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.1);
+}
+.card.loading {
+  opacity: 0.7;
+}
+
+/* Action buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  border: none;
+}
+.btn-primary {
+  background: var(--color-primary);
+  color: white;
+}
+.btn-primary:hover {
+  background: var(--color-primary-dark);
+}
+.btn-cta {
+  background: var(--color-cta);
+  color: white;
+}
+.btn-cta:hover {
+  background: var(--color-cta-hover);
+}
+.btn-outline {
+  background: transparent;
+  border: 1px solid var(--color-border);
+  color: var(--color-text);
+}
+.btn-outline:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+.btn-ghost {
+  background: transparent;
+  color: var(--color-text-muted);
+}
+.btn-ghost:hover {
+  color: var(--color-primary);
+  background: rgba(124, 58, 237, 0.05);
+}
+
+/* Status bar */
+.status-bar {
+  background: rgba(124, 58, 237, 0.05);
+  border-top: 1px solid var(--color-border);
+  padding: 0.75rem 1.5rem;
+  font-size: 0.875rem;
+  color: var(--color-text-muted);
+}
+
+/* Input bar */
+.input-bar {
+  border-top: 1px solid var(--color-border);
+  padding: 1rem 1.5rem;
+  background: white;
+}
+.input-bar input {
+  width: 100%;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  font-size: 0.9rem;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+.input-bar input:focus {
+  border-color: var(--color-primary);
+}
+
+/* Animations */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+@keyframes progress {
+  0% { transform: translateX(-100%); }
+  50% { transform: translateX(100%); }
+  100% { transform: translateX(300%); }
+}
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in {
+  animation: fade-in 0.3s ease forwards;
+}
+.animate-pulse-dot {
+  animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
+/* Compare mode animations */
+@keyframes shrink-card {
+  from { flex: 1; opacity: 1; }
+  to { flex: 0.45; opacity: 0.85; }
+}
+@keyframes expand-card {
+  from { flex: 0; opacity: 0; max-width: 0; }
+  to { flex: 0.55; opacity: 1; max-width: 100%; }
+}
+@keyframes win-card {
+  from { flex: 0.5; }
+  to { flex: 1; }
+}
+@keyframes lose-card {
+  from { flex: 0.5; opacity: 1; max-width: 50%; }
+  to { flex: 0; opacity: 0; max-width: 0; overflow: hidden; }
+}
+.compare-old {
+  animation: shrink-card 0.4s ease forwards;
+  overflow-y: auto;
+  max-height: 500px;
+}
+.compare-new {
+  animation: expand-card 0.4s ease forwards;
+  overflow-y: auto;
+  max-height: 500px;
+}
+.compare-win {
+  animation: win-card 0.4s ease forwards;
+}
+.compare-lose {
+  animation: lose-card 0.3s ease forwards;
+  pointer-events: none;
+}
+
+/* Markdown content in cards */
+.card-content h1, .card-content h2, .card-content h3 {
+  font-family: var(--font-heading);
+  margin-top: 1rem;
+  margin-bottom: 0.5rem;
+}
+.card-content p {
+  margin-bottom: 0.75rem;
+  line-height: 1.6;
+}
+.card-content ul, .card-content ol {
+  padding-left: 1.5rem;
+  margin-bottom: 0.75rem;
+}
+.card-content table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 1rem;
+}
+.card-content th, .card-content td {
+  padding: 0.5rem;
+  border: 1px solid var(--color-border);
+  text-align: left;
+}
+.card-content th {
+  background: var(--color-bg);
+  font-weight: 600;
+}

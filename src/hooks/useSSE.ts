@@ -49,10 +49,19 @@ export function useSSE(dispatch: React.Dispatch<AppAction>) {
         ...options,
       }
 
+      // 线上 Makers 平台需要 makers-conversation-id header
+      const convId = conversationIdRef.current || crypto.randomUUID()
+      if (!conversationIdRef.current) {
+        conversationIdRef.current = convId
+      }
+
       const response = await fetch("/stream", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        headers: {
+          "Content-Type": "application/json",
+          "makers-conversation-id": convId,
+        },
+        body: JSON.stringify({ ...body, conversation_id: convId }),
         signal: controller.signal,
       })
 
@@ -121,7 +130,10 @@ export function useSSE(dispatch: React.Dispatch<AppAction>) {
     try {
       const response = await fetch("/stream", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "makers-conversation-id": cid,
+        },
         body: JSON.stringify({
           action: "history",
           conversation_id: cid,

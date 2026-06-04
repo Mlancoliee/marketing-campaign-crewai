@@ -38,27 +38,37 @@ export default function IntegrationView({ cards, streaming, activeAgents, onActi
 
   const actions = !isLoading && !streaming && !previousStrategy && content ? [
     {
-      label: t("action.confirm"),
-      type: "confirm" as const,
-      onClick: (feedback?: string) => handleConfirm(feedback),
-    },
-    {
       label: t("action.redo"),
       type: "redo" as const,
       onClick: (feedback?: string) => handleRedo(feedback),
-    },
-    {
-      label: t("action.rollback"),
-      type: "rollback" as const,
-      onClick: () => onAction("rollback"),
     },
   ] : undefined
 
   return (
     <div className="max-w-3xl mx-auto">
-      <h2 className="text-lg font-semibold font-[var(--font-heading)] mb-4">
-        {t("phase.integration")}
-      </h2>
+      <div className="sticky -top-4 z-10 bg-[var(--color-bg)] pt-4 pb-2 -mx-6 px-6 flex items-center justify-between mb-4 border-b border-[var(--color-border)]">
+        <h2 className="text-lg font-semibold font-[var(--font-heading)]">
+          {t("phase.integration")}
+        </h2>
+        <div className="flex gap-2">
+          {!isLoading && !streaming && !previousStrategy && content && (
+            <>
+              <button onClick={() => onAction("rollback")} className="btn btn-ghost cursor-pointer text-xs">
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M11 17l-5-5m0 0l5-5m-5 5h12" />
+                </svg>
+                {t("action.rollback")}
+              </button>
+              <button onClick={() => handleConfirm()} className="btn btn-cta cursor-pointer text-xs">
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M13 7l5 5m0 0l-5 5m5-5H6" />
+                </svg>
+                {t("action.confirm") === "确认" ? "进入内容产出" : "Next"}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
 
       {previousStrategy ? (
         <CompareCards

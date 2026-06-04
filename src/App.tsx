@@ -64,6 +64,7 @@ function reducer(state: AppState, action: AppAction): AppState {
         phase: action.phase,
         progress: action.progress || getProgress(action.phase),
         pendingActions: [],
+        statusMessage: "",
       }
 
     case "AGENT_START":
@@ -160,10 +161,10 @@ function reducer(state: AppState, action: AppAction): AppState {
       return { ...state, streaming: true, suggestions: [] }
 
     case "STREAMING_END":
-      return { ...state, streaming: false }
+      return { ...state, streaming: false, statusMessage: "" }
 
     case "DONE":
-      return { ...state, streaming: false }
+      return { ...state, streaming: false, statusMessage: "" }
 
     case "ERROR":
       return { ...state, streaming: false, statusMessage: `Error: ${action.message}` }
@@ -291,6 +292,7 @@ export default function App() {
             parallelActive={state.parallelActive}
             onCardAction={handleCardAction}
             onRestoreCard={(card, data) => dispatch({ type: "CARD_UPDATE", card, data })}
+            onNext={() => send({ phase_action: { type: "confirm" }, locale: state.locale })}
           />
         )
       case "integration":

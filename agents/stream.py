@@ -316,8 +316,7 @@ async def _stream_resume(body, stored, conversation_id, context):
 
     if next_route == "wait":
         save_flow_state(conversation_id, state.model_dump(), {"phase": phase})
-        yield {"type": "status", "message": "等待确认另一个方案..." if locale == "zh" else "Waiting for other confirmation...", "from": "chief_strategist"}
-        yield {"type": "actions", "actions": _get_actions_for_phase(phase, state, locale)}
+        yield {"type": "status", "message": "已保存" if locale == "zh" else "Saved", "from": "chief_strategist"}
         return
 
     # Rollback：只切换阶段，恢复已有数据，不清除下游（redo 才清除）
@@ -611,7 +610,14 @@ def _determine_next_route_from_state(body, state, current_phase):
         feedback = phase_action.get("feedback", "")
 
         if action_type == "confirm":
-            if current_phase == "integration":
+            if current_phase == "planning":
+                state.brand_confirmed = True
+                state.channel_confirmed = True
+                state.selected_creative_index = 0
+                if state.integrated_strategy:
+                    return "restore_integration"
+                return "integration"
+            elif current_phase == "integration":
                 if state.copywriting:
                     return "restore_content"
                 return "content"

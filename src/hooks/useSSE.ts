@@ -128,17 +128,27 @@ export function useSSE(dispatch: React.Dispatch<AppAction>) {
     if (!cid) return
 
     try {
-      const response = await fetch("/stream", {
+      // 优先调用 cloud-function /history（独立于 agent 进程）
+      let response = await fetch("/history", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "makers-conversation-id": cid,
         },
-        body: JSON.stringify({
-          action: "history",
-          conversation_id: cid,
-        }),
+        body: JSON.stringify({ conversation_id: cid }),
       })
+
+      // 如果 /history 不可用（404），回退到 agent /stream
+      if (!response.ok) {
+        response = await fetch("/stream", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "makers-conversation-id": cid,
+          },
+          body: JSON.stringify({ action: "history", conversation_id: cid }),
+        })
+      }
 
       if (!response.ok) return
 
@@ -155,7 +165,6 @@ export function useSSE(dispatch: React.Dispatch<AppAction>) {
             cards: data.cards || {},
             messages: (data.chat_history || []).map((m: { role: string; content: string; phase?: string }) => {
               let content = m.content
-              // 清理 [SUGGESTIONS] 标记
               if (content.includes("[SUGGEST")) {
                 content = content.split("[SUGGEST")[0].trim()
               }
@@ -164,7 +173,6 @@ export function useSSE(dispatch: React.Dispatch<AppAction>) {
           },
         })
       } else {
-        // 会话已过期（服务端重启后丢失）
         dispatch({ type: "STATUS", message: "会话已过期，请新建" })
       }
     } catch {

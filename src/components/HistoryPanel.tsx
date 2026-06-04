@@ -7,6 +7,7 @@ interface HistoryPanelProps {
   open: boolean
   onClose: () => void
   onSelect: (id: string) => void
+  currentId?: string
 }
 
 function formatTime(ts: number): string {
@@ -17,7 +18,7 @@ function formatTime(ts: number): string {
   return new Date(ts).toLocaleDateString()
 }
 
-export default function HistoryPanel({ open, onClose, onSelect }: HistoryPanelProps) {
+export default function HistoryPanel({ open, onClose, onSelect, currentId }: HistoryPanelProps) {
   const [items, setItems] = useState<HistoryItem[]>(getHistory)
 
   // 每次打开时刷新列表
@@ -29,6 +30,12 @@ export default function HistoryPanel({ open, onClose, onSelect }: HistoryPanelPr
     e.stopPropagation()
     removeHistory(id)
     setItems(getHistory())
+    // 同时删除服务端数据
+    fetch("/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "makers-conversation-id": id },
+      body: JSON.stringify({ conversation_id: id }),
+    }).catch(() => {})
   }, [])
 
   const handleSelect = useCallback((id: string) => {
@@ -65,7 +72,11 @@ export default function HistoryPanel({ open, onClose, onSelect }: HistoryPanelPr
                 <div
                   key={item.id}
                   onClick={() => handleSelect(item.id)}
-                  className="px-4 py-3 hover:bg-[var(--color-bg)] cursor-pointer transition-colors flex items-center justify-between group"
+                  className={`px-4 py-3 cursor-pointer transition-colors flex items-center justify-between group ${
+                    item.id === currentId
+                      ? "bg-[var(--color-primary)]/5 border-l-2 border-[var(--color-primary)]"
+                      : "hover:bg-[var(--color-bg)]"
+                  }`}
                 >
                   <div className="min-w-0">
                     <p className="text-sm font-medium truncate">{item.campaignName}</p>

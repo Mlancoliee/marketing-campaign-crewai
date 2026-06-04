@@ -382,6 +382,7 @@ export default function App() {
         open={historyOpen}
         onClose={() => setHistoryOpen(false)}
         onSelect={handleSelectHistory}
+        currentId={state.conversationId}
       />
     </div>
   )

@@ -18,3 +18,9 @@ Thumbs.db
 .idea/
 *.swp
 docs/
+
+# Tencent Cloud EdgeOne
+.env
+.edgeone/*
+.tef_dist/*
+  

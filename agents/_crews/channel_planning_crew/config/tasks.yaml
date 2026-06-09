@@ -14,8 +14,12 @@ channel_strategy_task:
     4. Budget Allocation - percentage split across channels with brief rationale
 
     Be specific and actionable. Use tables where helpful.
+    IMPORTANT formatting rules:
+    - In Markdown tables, each row MUST be on a single line. Do NOT put line breaks inside table cells.
+    - Keep table cell content concise. If content is long, use short summaries in the table and add details below the table.
+    - Do NOT use <br> or HTML tags. Use plain Markdown only.
     Language: Respond in {locale_instruction}.
   expected_output: >
-    A structured channel strategy containing channel mix with rationale,
-    role of each channel, campaign timeline with phases, and budget allocation.
+    A structured channel strategy in pure Markdown format (no HTML tags).
+    Tables must have each row on a single line with no line breaks inside cells.
   agent: channel_planner

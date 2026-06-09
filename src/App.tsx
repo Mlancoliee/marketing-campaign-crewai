@@ -74,8 +74,7 @@ function reducer(state: AppState, action: AppAction): AppState {
       }
 
     case "CHUNK": {
-      // 清理 HTML 标签（LLM 有时输出 <br> 等）
-      const content = action.content.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, "")
+      const content = action.content
 
       // discovery 阶段不处理流式 chunk
       if (state.phase === "discovery") {
@@ -108,9 +107,10 @@ function reducer(state: AppState, action: AppAction): AppState {
       const cardKey = agentCardMap[action.agent]
       if (cardKey) {
         const existing = (state.cards[cardKey as keyof typeof state.cards] as Record<string, unknown>) || {}
-        const currentRaw = (existing.raw as string) || ""
-        // 用 raw 覆盖，删除 content/creatives/plan 等旧字段避免组件读取旧数据
-        newCards = { ...state.cards, [cardKey]: { raw: currentRaw + content } }
+        let newRaw = ((existing.raw as string) || "") + content
+        // 清理累积内容中的完整 HTML 标签（解决标签被分割到多个 chunk 的问题）
+        newRaw = newRaw.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, "")
+        newCards = { ...state.cards, [cardKey]: { raw: newRaw } }
       }
 
       return { ...state, messages: newMessages, cards: newCards }
@@ -130,11 +130,27 @@ function reducer(state: AppState, action: AppAction): AppState {
         cards: { ...state.cards, [action.card]: null },
       }
 
-    case "CARD_UPDATE":
+    case "CARD_UPDATE": {
+      // 递归清理 data 中所有字符串的 HTML 标签
+      const cleanHtml = (obj: unknown): unknown => {
+        if (typeof obj === "string") {
+          return obj.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, "")
+        }
+        if (Array.isArray(obj)) return obj.map(cleanHtml)
+        if (obj && typeof obj === "object") {
+          const result: Record<string, unknown> = {}
+          for (const [k, v] of Object.entries(obj)) {
+            result[k] = cleanHtml(v)
+          }
+          return result
+        }
+        return obj
+      }
       return {
         ...state,
-        cards: { ...state.cards, [action.card]: action.data },
+        cards: { ...state.cards, [action.card]: cleanHtml(action.data) as Record<string, unknown> },
       }
+    }
 
     case "ACTIONS":
       return { ...state, pendingActions: action.actions }
@@ -161,7 +177,7 @@ function reducer(state: AppState, action: AppAction): AppState {
       return { ...state, streaming: true, suggestions: [] }
 
     case "STREAMING_END":
-      return { ...state, streaming: false, statusMessage: "" }
+      return { ...state, streaming: false, statusMessage: state.statusMessage.startsWith("Error") ? state.statusMessage : "" }
 
     case "DONE":
       return { ...state, streaming: false, statusMessage: "" }

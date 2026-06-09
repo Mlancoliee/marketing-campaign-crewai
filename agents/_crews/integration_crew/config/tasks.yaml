@@ -18,9 +18,13 @@ integrate_task:
     - Add campaign objectives, key messages per channel, success metrics (KPIs)
     - Keep it actionable - this is the master plan the team will execute from
 
+    IMPORTANT formatting rules:
+    - Use pure Markdown only. Do NOT use HTML tags like <br>.
+    - In Markdown tables, each row MUST be on a single line. No line breaks inside table cells.
+    - Keep table cells concise. Put detailed explanations below the table, not inside cells.
+
     Language: Respond in {locale_instruction}.
   expected_output: >
-    A unified marketing strategy document containing campaign objectives,
-    target audience summary, creative direction, key messages, channel plan,
-    timeline, budget, and KPIs.
+    A unified marketing strategy document in pure Markdown (no HTML).
+    Tables must have each row on a single line.
   agent: chief_strategist

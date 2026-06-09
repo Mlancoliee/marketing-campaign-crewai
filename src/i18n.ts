@@ -9,7 +9,7 @@ const zh: Messages = {
   "app.history": "历史",
 
   // Phases
-  "phase.discovery": "市场调研",
+  "phase.discovery": "需求调研",
   "phase.planning": "方案策划",
   "phase.integration": "策略整合",
   "phase.content": "内容产出",
@@ -52,6 +52,9 @@ const zh: Messages = {
   "start.example1": "新茶饮品牌 618 促销活动",
   "start.example2": "SaaS 产品线上发布会推广",
   "start.example3": "线下零售门店周年庆",
+  "start.brief1": "新茶饮品牌夏日促销，目标年轻女性群体，预算50万，线上为主",
+  "start.brief2": "B2B SaaS 产品线上发布会，面向中小企业 CTO/IT负责人",
+  "start.brief3": "大型商场5周年庆，辐射周边3公里社区家庭消费者",
 
   // Input
   "input.placeholder": "输入你的回答或反馈...",
@@ -101,6 +104,9 @@ const en: Messages = {
   "start.example1": "New beverage brand summer promotion",
   "start.example2": "SaaS product launch campaign",
   "start.example3": "Retail store anniversary event",
+  "start.brief1": "New tea brand summer promo targeting young women, $70K budget, primarily online",
+  "start.brief2": "B2B SaaS product launch event, targeting SMB CTOs and IT leaders",
+  "start.brief3": "Large shopping mall 5th anniversary, targeting families within 3km radius",
 
   "input.placeholder": "Type your answer or feedback...",
   "input.feedback_placeholder": "Give feedback...",

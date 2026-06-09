@@ -7,9 +7,9 @@ interface StartPanelProps {
 }
 
 const EXAMPLES = [
-  { name: "start.example1", brief: "新茶饮品牌夏日促销，目标年轻女性群体，预算50万，线上为主" },
-  { name: "start.example2", brief: "B2B SaaS 产品线上发布会，面向中小企业 CTO/IT负责人" },
-  { name: "start.example3", brief: "大型商场5周年庆，辐射周边3公里社区家庭消费者" },
+  { name: "start.example1", brief: "start.brief1" },
+  { name: "start.example2", brief: "start.brief2" },
+  { name: "start.example3", brief: "start.brief3" },
 ]
 
 export default function StartPanel({ onStart, disabled }: StartPanelProps) {
@@ -25,7 +25,7 @@ export default function StartPanel({ onStart, disabled }: StartPanelProps) {
   const handleExample = useCallback((idx: number) => {
     const ex = EXAMPLES[idx]
     setName(t(ex.name))
-    setBrief(ex.brief)
+    setBrief(t(ex.brief))
   }, [])
 
   return (

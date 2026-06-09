@@ -1,4 +1,5 @@
 """Crew 执行引擎 — 构建、流式执行、状态更新"""
+import re
 import asyncio
 
 from agents._lib.sse_events import format_qa_history
@@ -245,8 +246,16 @@ Campaign: {state.campaign_name}
     return None, ""
 
 
+def _clean_html(text: str) -> str:
+    """清理 LLM 输出中的 HTML 标签"""
+    text = re.sub(r'<br\s*/?>', '\n', text)
+    text = re.sub(r'<[^>]+>', '', text)
+    return text
+
+
 def update_state_after_crew(state, route, result_text):
     """Crew 执行完后更新 state"""
+    result_text = _clean_html(result_text)
     if route == "discovery_resume":
         if "[READY]" in result_text:
             content = result_text.split("[READY]", 1)[1].strip()

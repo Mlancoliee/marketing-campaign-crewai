@@ -29,6 +29,11 @@ export default function ContentView({ cards, streaming, activeAgents, onAction }
     onAction("confirm", feedback)
   }, [onAction])
 
+  const handleAcceptNew = useCallback(() => {
+    // Just accept the new version (clear compare mode), don't advance
+    setPreviousCopy(null)
+  }, [])
+
   const handleKeepOld = useCallback(() => {
     if (previousCopy) {
       onAction("keep_old", previousCopy)
@@ -75,7 +80,7 @@ export default function ContentView({ cards, streaming, activeAgents, onAction }
           oldContent={previousCopy}
           newContent={raw || ""}
           loading={isLoading}
-          onAcceptNew={() => handleConfirm()}
+          onAcceptNew={handleAcceptNew}
           onKeepOld={handleKeepOld}
           onReviseAgain={(fb) => handleRedo(fb)}
         />

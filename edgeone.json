@@ -1,6 +1,14 @@
 {
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
+  "agents": {
+    "framework": "crewai",
+    "dir": "agents",
+    "timeout": 300,
+    "sandbox": {
+      "timeout": 300
+    }
+  },
   "cloudFunctions": {
     "nodejs": {
       "includeFiles": []

@@ -1,44 +1,40 @@
-import yaml
-from pathlib import Path
-from crewai import Agent, Crew, Task, Process
+from crewai import Agent, Crew, Process, Task
+from crewai.agents.agent_builder.base_agent import BaseAgent
+from crewai.project import CrewBase, agent, crew, task
 
-from agents._lib.llm import get_streaming_llm
-
-
-_AGENTS_YAML = Path(__file__).parent.parent / "agents.yaml"
-_TASKS_YAML = Path(__file__).parent / "config" / "tasks.yaml"
+from agents._lib.llm import get_llm
 
 
+@CrewBase
 class BrandCreativeCrew:
-    """品牌创意 Crew - 产出 2-3 套创意方案"""
+    """品牌创意 Crew — 产出 2-3 套创意方案。"""
 
-    def __init__(self):
-        with open(_AGENTS_YAML, "r") as f:
-            self.agents_config = yaml.safe_load(f)
-        with open(_TASKS_YAML, "r") as f:
-            self.tasks_config = yaml.safe_load(f)
+    agents: list[BaseAgent]
+    tasks: list[Task]
 
-    def crew(self, inputs: dict) -> Crew:
-        llm = get_streaming_llm()
+    agents_config = "../agents.yaml"
+    tasks_config = "config/tasks.yaml"
 
-        brand_creative_director = Agent(
-            role=self.agents_config["brand_creative_director"]["role"].strip(),
-            goal=self.agents_config["brand_creative_director"]["goal"].strip(),
-            backstory=self.agents_config["brand_creative_director"]["backstory"].strip(),
-            llm=llm,
-            verbose=False,
+    @agent
+    def brand_creative_director(self) -> Agent:
+        return Agent(
+            config=self.agents_config["brand_creative_director"],
+            llm=get_llm(),
+            memory=False,
         )
 
-        task_config = self.tasks_config["creative_concepts_task"]
-        creative_task = Task(
-            description=task_config["description"].format(**inputs),
-            expected_output=task_config["expected_output"],
-            agent=brand_creative_director,
+    @task
+    def creative_concepts_task(self) -> Task:
+        return Task(
+            config=self.tasks_config["creative_concepts_task"],
+            agent=self.brand_creative_director(),
         )
 
+    @crew
+    def crew(self) -> Crew:
         return Crew(
-            agents=[brand_creative_director],
-            tasks=[creative_task],
+            agents=self.agents,
+            tasks=self.tasks,
             process=Process.sequential,
             verbose=False,
         )

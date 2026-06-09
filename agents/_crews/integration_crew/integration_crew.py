@@ -1,44 +1,40 @@
-import yaml
-from pathlib import Path
-from crewai import Agent, Crew, Task, Process
+from crewai import Agent, Crew, Process, Task
+from crewai.agents.agent_builder.base_agent import BaseAgent
+from crewai.project import CrewBase, agent, crew, task
 
-from agents._lib.llm import get_streaming_llm
-
-
-_AGENTS_YAML = Path(__file__).parent.parent / "agents.yaml"
-_TASKS_YAML = Path(__file__).parent / "config" / "tasks.yaml"
+from agents._lib.llm import get_llm
 
 
+@CrewBase
 class IntegrationCrew:
-    """策略整合 Crew - 策略总监整合品牌+渠道为统一方案"""
+    """策略整合 Crew — 策略总监将品牌+渠道整合为统一方案。"""
 
-    def __init__(self):
-        with open(_AGENTS_YAML, "r") as f:
-            self.agents_config = yaml.safe_load(f)
-        with open(_TASKS_YAML, "r") as f:
-            self.tasks_config = yaml.safe_load(f)
+    agents: list[BaseAgent]
+    tasks: list[Task]
 
-    def crew(self, inputs: dict) -> Crew:
-        llm = get_streaming_llm()
+    agents_config = "../agents.yaml"
+    tasks_config = "config/tasks.yaml"
 
-        chief_strategist = Agent(
-            role=self.agents_config["chief_strategist"]["role"].strip(),
-            goal=self.agents_config["chief_strategist"]["goal"].strip(),
-            backstory=self.agents_config["chief_strategist"]["backstory"].strip(),
-            llm=llm,
-            verbose=False,
+    @agent
+    def chief_strategist(self) -> Agent:
+        return Agent(
+            config=self.agents_config["chief_strategist"],
+            llm=get_llm(),
+            memory=False,
         )
 
-        task_config = self.tasks_config["integrate_task"]
-        integrate_task = Task(
-            description=task_config["description"].format(**inputs),
-            expected_output=task_config["expected_output"],
-            agent=chief_strategist,
+    @task
+    def integrate_task(self) -> Task:
+        return Task(
+            config=self.tasks_config["integrate_task"],
+            agent=self.chief_strategist(),
         )
 
+    @crew
+    def crew(self) -> Crew:
         return Crew(
-            agents=[chief_strategist],
-            tasks=[integrate_task],
+            agents=self.agents,
+            tasks=self.tasks,
             process=Process.sequential,
             verbose=False,
         )

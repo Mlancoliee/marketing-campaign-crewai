@@ -1,546 +1,587 @@
-"""
-POST /stream - 营销活动策划 Agent 主入口
+"""POST /stream — 营销活动策划 Agent 主入口 (SSE streaming)
 
-处理所有对话轮次：
-- action: "history" → 返回存储的历史
-- action: "send" → kickoff 或 resume
+架构：
+- 主流程（discovery → planning → integration → content → finalize）
+  由 MarketingCampaignFlow 管理，使用 @human_feedback 暂停/恢复
+- 分支操作（redo_brand / redo_channel / rollback 等）
+  由 handler 层拦截，直接调用 Crew，不进 Flow
 """
-import uuid
+
 import asyncio
-import traceback
 
-from agents._lib.state import CampaignState
-from agents._lib.persistence import save_state, load_state, delete_state
+from crewai.flow.async_feedback.types import HumanFeedbackPending
+from crewai.types.streaming import FlowStreamingOutput, StreamChunkType
+from crewai.utilities.streaming import (
+    create_async_chunk_generator,
+    create_streaming_state,
+    register_cleanup,
+    signal_end,
+    signal_error,
+)
+
+from agents._lib.flow import MarketingCampaignFlow, CampaignState, bind_collapse_llm, _crew_text
+from agents._lib.llm import init_llm
 from agents._lib.logger import make_logger
-from agents._lib.store_utils import persist_to_store, save_messages_to_store
-from agents._lib.router import determine_next_route
-from agents._lib.crew_runner import execute_crew_streaming, build_crew_for_route, update_state_after_crew
-from agents._lib.sse_events import emit_card_update, generate_suggestions, get_actions_for_phase, format_qa_history
-from agents._lib.helpers import route_to_phase, phase_to_progress, route_to_agent, route_to_lane, get_status_message
+from agents._lib.persistence import (
+    get_persistence, has_pending, load_pending_from_store, sync_pending_to_store,
+)
+
+# Crew imports for branch actions
+from agents._crews.brand_creative_crew.brand_creative_crew import BrandCreativeCrew
+from agents._crews.channel_planning_crew.channel_planning_crew import ChannelPlanningCrew
+from agents._crews.integration_crew.integration_crew import IntegrationCrew
+from agents._crews.content_crew.content_crew import ContentCrew
 
 log = make_logger("Handler")
 
 
+# ─── Streaming resume wrapper ────────────────────────────────────────
 
+async def _stream_resume(flow, feedback: str) -> FlowStreamingOutput:
+    """Wrap resume_async in streaming infrastructure.
+
+    CrewAI's resume_async() doesn't return a streaming iterator, but the
+    underlying Crew still emits LLMStreamChunkEvent to the event bus.
+    This helper subscribes to those events — same pattern as kickoff_async.
+    """
+    result_holder: list = []
+    task_info = {"index": 0, "name": "", "id": "", "agent_role": "", "agent_id": ""}
+    state = create_streaming_state(task_info, result_holder, use_async=True)
+    output_holder: list = []
+
+    async def run():
+        try:
+            result = await flow.resume_async(feedback)
+            result_holder.append(result)
+        except Exception as e:
+            if isinstance(e, HumanFeedbackPending):
+                result_holder.append(e)
+            else:
+                signal_error(state, e, is_async=True)
+        finally:
+            signal_end(state, is_async=True)
+
+    streaming = FlowStreamingOutput(
+        async_iterator=create_async_chunk_generator(state, run, output_holder)
+    )
+    register_cleanup(streaming, state)
+    output_holder.append(streaming)
+    return streaming
+
+
+# ─── Branch action detection ─────────────────────────────────────────
+
+BRANCH_ACTIONS = {
+    "rollback_to_planning", "rollback_to_integration", "rollback_to_content",
+}
+
+
+def _parse_action(message: str) -> tuple[str, str]:
+    """Parse ACTION:xxx|feedback=yyy from message. Returns (action, feedback)."""
+    if not message.startswith("ACTION:"):
+        return "", message
+    parts = message[7:].split("|", 1)
+    action = parts[0].strip()
+    feedback = ""
+    if len(parts) > 1 and "=" in parts[1]:
+        feedback = parts[1].split("=", 1)[1].strip()
+    return action, feedback
+
+
+def _is_branch_action(message: str) -> bool:
+    """Check if this message is a branch action that should bypass Flow."""
+    if message.startswith("ACTION:"):
+        action, _ = _parse_action(message)
+        return action in BRANCH_ACTIONS
+    return False
+
+
+# ─── Main handler ────────────────────────────────────────────────────
 
 async def handler(context):
-    """Pages Agent handler 入口"""
-    body = context.request.body
-    action = body.get("action", "send")
+    """POST /stream — conversation turn (streaming)."""
+    conversation_id = getattr(context, "conversation_id", None)
+    body = context.request.body or {}
 
+    # Parse user input — support both text message and structured phase_action
+    user_message = (
+        body.get("message")
+        or body.get("user_message")
+        or body.get("campaign_brief")
+        or ""
+    ).strip()
+    campaign_name = body.get("campaign_name", "")
+    locale = body.get("locale", "zh")
+    action = body.get("action", "send")
+    phase_action = body.get("phase_action")  # e.g., {"type": "confirm"}
+    card_action = body.get("card_action")    # e.g., {"target": "brand", "type": "redo", "feedback": "..."}
+    iteration_feedback = body.get("iteration_feedback", "")  # e.g., "预算改为200万"
+
+    # iteration_feedback → treat as revise_document action
+    if iteration_feedback:
+        user_message = f"ACTION:revise_document|feedback={iteration_feedback}"
+
+    # Convert phase_action to feedback string
+    if phase_action and isinstance(phase_action, dict):
+        pa_type = phase_action.get("type", "")
+        pa_feedback = phase_action.get("feedback", "")
+        if pa_type == "confirm":
+            user_message = user_message or "ACTION:confirm"
+        elif pa_type == "keep_old":
+            # keep_old is a frontend-only action — return minimal SSE acknowledgment
+            async def _keep_old_gen2():
+                yield context.utils.sse({"type": "done", "status": "completed"})
+            return context.utils.stream_sse(_keep_old_gen2())
+        elif pa_type in BRANCH_ACTIONS:
+            user_message = f"ACTION:{pa_type}" + (f"|feedback={pa_feedback}" if pa_feedback else "")
+        elif pa_type and not user_message:
+            user_message = f"ACTION:{pa_type}"
+
+    # Convert card_action to feedback string
+    if card_action and isinstance(card_action, dict):
+        ca_target = card_action.get("target", "")  # "brand" | "channel"
+        ca_type = card_action.get("type", "")      # "confirm" | "redo" | "keep_old"
+        ca_feedback = card_action.get("feedback", "")
+
+        if ca_type == "redo" and ca_target:
+            user_message = f"ACTION:redo_{ca_target}" + (f"|feedback={ca_feedback}" if ca_feedback else "")
+        elif ca_type == "confirm":
+            user_message = user_message or "ACTION:confirm"
+        elif ca_type == "keep_old":
+            # keep_old is a frontend-only action — return minimal SSE acknowledgment
+            async def _keep_old_gen():
+                yield context.utils.sse({"type": "done", "status": "completed"})
+            return context.utils.stream_sse(_keep_old_gen())
+
+    # Handle skip_discovery (frontend "信息够了，开始策划" button)
+    if body.get("skip_discovery"):
+        user_message = user_message or "ACTION:confirm"
+
+    # History action
     if action == "history":
         return await _handle_history(context, body)
-    else:
-        return await _handle_send(context, body)
 
+    # Init LLM
+    try:
+        init_llm(context.env)
+        bind_collapse_llm()
+    except Exception as e:
+        log(f"LLM init error: {e}")
+        return {"status_code": 500, "body": {"error": str(e)}}
 
-def _sse(context, data):
-    """使用 context.utils.sse 构造一帧 SSE"""
-    return context.utils.sse(data)
+    store = context.store
+    cid = conversation_id
+    persistence = get_persistence()
 
+    # Check if this is a resume (pending feedback exists)
+    is_resume = has_pending(cid)
+    if not is_resume:
+        is_resume = await load_pending_from_store(cid, store)
+    log(f"turn={'resume' if is_resume else 'kickoff'} cid={cid}")
 
-async def _handle_history(context, body):
-    """返回对话历史 - 从 context.store 读取"""
-    conversation_id = body.get("conversation_id", "")
+    # ── SSE generator ──
+    async def gen():
+        pending_writes: list[asyncio.Task] = []
 
-    # 从平台 store 读取
-    if hasattr(context, "store") and conversation_id:
+        def fire_save(role: str, content: str, metadata: dict | None = None):
+            async def _save():
+                try:
+                    await store.append_message(
+                        conversation_id=cid, role=role,
+                        content=content, metadata=metadata or {},
+                    )
+                except Exception as e:
+                    log(f"store write failed: {e}")
+            pending_writes.append(asyncio.create_task(_save()))
+
         try:
-            # 读取对话元信息（存储了 phase 和 cards）
-            meta = await context.store.get_conversation(conversation_id=conversation_id)
-            if meta and meta.metadata:
-                # 读取消息历史
-                messages = await context.store.get_messages(conversation_id=conversation_id, limit=100, order="asc")
-                chat_history = []
-                for m in messages:
-                    meta_data = m.metadata or {}
-                    if meta_data.get("type") == "init":
-                        continue
-                    role = meta_data.get("agent", m.role)
-                    chat_history.append({"role": role, "content": m.content, "phase": meta_data.get("phase", "")})
+            yield context.utils.sse({"type": "flow_start"})
 
-                cards = meta.metadata.get("cards", {})
-                current_phase = meta.metadata.get("current_phase", "start")
+            # Save user message
+            if user_message:
+                fire_save("user", user_message)
 
-                # 重建 state 写回内存，确保后续操作能 resume
-                state_dict = {
-                    "campaign_name": meta.metadata.get("campaign_name", ""),
-                    "campaign_brief": "",
-                    "locale": "zh",
-                    "current_phase": current_phase,
-                    "chat_history": chat_history,
-                    "qa_history": [],
-                    "discovery_rounds": 0,
-                    "audience_profile": (cards.get("audience") or {}).get("content", ""),
-                    "market_insights": (cards.get("audience") or {}).get("content", ""),
-                    "brand_creatives": (cards.get("brand_creative") or {}).get("creatives", []),
-                    "channel_plan": (cards.get("channel_plan") or {}).get("plan", {}),
-                    "selected_creative_index": 0,
-                    "brand_confirmed": current_phase not in ("discovery", "planning"),
-                    "channel_confirmed": current_phase not in ("discovery", "planning"),
-                    "integrated_strategy": (cards.get("strategy") or {}).get("content", ""),
-                    "copywriting": cards.get("copywriting") or {},
-                    "latest_feedback": "",
-                    "iteration_target": "",
-                    "iteration_count": 0,
-                    "finished": False,
-                }
-                save_state(conversation_id, state_dict, {"phase": current_phase})
+            # ── Branch action: bypass Flow ──
+            if is_resume and _is_branch_action(user_message):
+                async for event in _handle_branch_action(
+                    user_message, cid, persistence, locale, context
+                ):
+                    yield context.utils.sse(event)
+                await sync_pending_to_store(cid, store)
+                if pending_writes:
+                    await asyncio.gather(*pending_writes, return_exceptions=True)
+                yield context.utils.sse({"type": "done", "status": "completed"})
+                return
 
-                return {
-                    "conversation_id": conversation_id,
-                    "chat_history": chat_history,
-                    "current_phase": current_phase,
-                    "cards": cards,
-                }
-        except Exception:
-            pass
+            # ── Main Flow: kickoff or resume ──
+            if is_resume:
+                # Append user reply to qa_history for discovery context
+                pending = persistence.load_pending_feedback(cid)
+                flow = MarketingCampaignFlow.from_pending(cid, persistence=persistence)
 
-    # 回退到内存 state
-    stored = load_state(conversation_id)
-    if stored and stored.get("state"):
-        state = stored["state"]
-        return {
-            "conversation_id": conversation_id,
-            "chat_history": state.get("chat_history", []),
-            "current_phase": state.get("current_phase", "discovery"),
-            "cards": {
-                "audience": {"content": state.get("audience_profile", "")} if state.get("audience_profile") else None,
-                "brand_creative": {"creatives": state.get("brand_creatives", [])} if state.get("brand_creatives") else None,
-                "channel_plan": {"plan": state.get("channel_plan", {})} if state.get("channel_plan") else None,
-                "strategy": {"content": state.get("integrated_strategy", "")} if state.get("integrated_strategy") else None,
-                "copywriting": {"content": state.get("copywriting", {})} if state.get("copywriting") else None,
-            },
-        }
-    return {"conversation_id": conversation_id, "chat_history": [], "current_phase": "start"}
+                # Inject user answer into qa_history if still in discovery
+                if flow.state.current_phase == "discovery" and user_message:
+                    flow.state.qa_history = (
+                        flow.state.qa_history + f"\nUser: {user_message}"
+                    ).strip()
 
-
-async def _handle_send(context, body):
-    """处理用户发送：kickoff 或 resume"""
-    conversation_id = body.get("conversation_id", str(uuid.uuid4()))
-    locale = body.get("locale", "zh")
-
-    stored = load_state(conversation_id)
-
-    # 如果内存没有但 context.store 有，自动恢复（处理多实例/重启场景）
-    if stored is None and hasattr(context, "store") and body.get("conversation_id"):
-        try:
-            meta = await context.store.get_conversation(conversation_id=conversation_id)
-            if meta and meta.metadata and meta.metadata.get("current_phase", "start") != "start":
-                cards = meta.metadata.get("cards", {})
-                current_phase = meta.metadata.get("current_phase", "start")
-                state_dict = {
-                    "campaign_name": meta.metadata.get("campaign_name", ""),
-                    "campaign_brief": "",
-                    "locale": locale,
-                    "current_phase": current_phase,
-                    "chat_history": [],
-                    "qa_history": [],
-                    "discovery_rounds": 0,
-                    "audience_profile": (cards.get("audience") or {}).get("content", ""),
-                    "market_insights": (cards.get("audience") or {}).get("content", ""),
-                    "brand_creatives": (cards.get("brand_creative") or {}).get("creatives", []),
-                    "channel_plan": (cards.get("channel_plan") or {}).get("plan", {}),
-                    "selected_creative_index": 0,
-                    "brand_confirmed": current_phase not in ("discovery", "planning"),
-                    "channel_confirmed": current_phase not in ("discovery", "planning"),
-                    "integrated_strategy": (cards.get("strategy") or {}).get("content", ""),
-                    "copywriting": cards.get("copywriting") or {},
-                    "latest_feedback": "",
-                    "iteration_target": "",
-                    "iteration_count": 0,
-                    "finished": False,
-                }
-                save_state(conversation_id, state_dict, {"phase": current_phase})
-                stored = load_state(conversation_id)
-        except Exception:
-            pass
-
-    # ── SSE 流式响应 ──
-    async def generate_sse():
-        try:
-            # 首先发送 conversation_id
-            yield _sse(context, {"type": "conversation_id", "data": {"id": conversation_id}})
-
-            if stored is None:
-                # 只有首次请求（带 campaign_name/campaign_brief）才 kickoff
-                # 如果前端传了 conversation_id 但后端找不到 state，说明会话过期
-                if body.get("conversation_id") and not body.get("campaign_name") and not body.get("campaign_brief"):
-                    yield _sse(context, {"type": "error", "message": "会话已过期，请新建" if locale == "zh" else "Session expired, please start new"})
-                else:
-                    async for event in _stream_kickoff(body, conversation_id, locale, context):
-                        yield _sse(context, event)
+                streaming = await _stream_resume(flow, user_message)
             else:
-                # 后续请求 - resume
-                async for event in _stream_resume(body, stored, conversation_id, context):
-                    yield _sse(context, event)
+                # First turn: kickoff
+                if not user_message:
+                    yield context.utils.sse({"type": "error", "message": "Missing message"})
+                    yield context.utils.sse({"type": "done", "status": "error"})
+                    return
+
+                flow = MarketingCampaignFlow(persistence=persistence)
+                # Set campaign_brief from first message
+                streaming = await flow.kickoff_async(inputs={
+                    "id": cid,
+                    "campaign_name": campaign_name,
+                    "campaign_brief": user_message,
+                    "locale": locale,
+                })
+
+            # ── Streaming loop ──
+            # Record phase BEFORE streaming to detect transitions
+            phase_before = flow.state.current_phase
+            prev_agent = ""
+            current_content = ""
+            agent_contents: list[tuple[str, str]] = []  # (agent_role, content)
+            in_parallel = False  # Track if we're in parallel planning mode
+            planning_emitted = False  # Track if we already sent phase_change for planning
+
+            yield context.utils.sse({"type": "phase_change", "phase": phase_before, "progress": _phase_progress(phase_before)})
+
+            # For first kickoff in discovery, emit initial agent_start
+            if phase_before == "discovery":
+                yield context.utils.sse({"type": "agent_start", "agent": "market_analyst"})
+
+            async for chunk in streaming:
+                raw_agent = (chunk.agent_role or "").strip()
+                agent_role = _normalize_agent(raw_agent)  # Convert to frontend agent_id
+
+                # Detect agent switch
+                if agent_role and agent_role != prev_agent:
+                    if prev_agent and current_content:
+                        fire_save("assistant", current_content, {"agent": prev_agent})
+                        agent_contents.append((prev_agent, current_content))
+                        current_content = ""
+                    if prev_agent:
+                        lane = _agent_to_lane(prev_agent)
+                        yield context.utils.sse({"type": "agent_end", "agent": prev_agent, **({"lane": lane} if lane else {})})
+
+                    # Detect phase transitions based on agent role
+                    lane = _agent_to_lane(agent_role)
+
+                    if lane in ("brand", "channel") and not planning_emitted:
+                        # Entering planning phase — emit phase_change + parallel_start
+                        planning_emitted = True
+                        yield context.utils.sse({"type": "phase_change", "phase": "planning", "progress": _phase_progress("planning")})
+                        yield context.utils.sse({"type": "parallel_start", "lanes": ["brand", "channel"]})
+                        in_parallel = True
+
+                    if lane == "channel" and _agent_to_lane(prev_agent) == "brand":
+                        # Switching from brand to channel within parallel
+                        yield context.utils.sse({"type": "card_update", "card": "brand_creative", "data": {"raw": agent_contents[-1][1] if agent_contents else ""}})
+
+                    if not lane and in_parallel:
+                        # Exiting parallel mode
+                        in_parallel = False
+                        yield context.utils.sse({"type": "parallel_end"})
+
+                    if agent_role == "chief_strategist" and phase_before not in ("discovery", "finalize"):
+                        yield context.utils.sse({"type": "phase_change", "phase": "integration", "progress": _phase_progress("integration")})
+                    elif agent_role == "copywriter":
+                        yield context.utils.sse({"type": "phase_change", "phase": "content", "progress": _phase_progress("content")})
+
+                    yield context.utils.sse({"type": "agent_start", "agent": agent_role, **({"lane": lane} if lane else {})})
+                    prev_agent = agent_role
+
+                if chunk.chunk_type == StreamChunkType.TEXT:
+                    text = chunk.content or ""
+                    current_content += text
+                    yield context.utils.sse({
+                        "type": "chunk",
+                        "agent": agent_role or prev_agent,
+                        "content": text,
+                    })
+
+            # Final agent content
+            if prev_agent and current_content:
+                fire_save("assistant", current_content, {"agent": prev_agent})
+                agent_contents.append((prev_agent, current_content))
+            if prev_agent:
+                lane = _agent_to_lane(prev_agent)
+                yield context.utils.sse({"type": "agent_end", "agent": prev_agent, **({"lane": lane} if lane else {})})
+
+            if in_parallel:
+                yield context.utils.sse({"type": "parallel_end"})
+
+            # ── Post-streaming: emit structured events ──
+            phase = flow.state.current_phase
+            log(f"Post-streaming: phase_before={phase_before} phase_after={phase} "
+                f"audience={bool(flow.state.audience_profile)} "
+                f"brand={bool(flow.state.brand_creatives)} "
+                f"channel={bool(flow.state.channel_plan)} "
+                f"strategy={bool(flow.state.integrated_strategy)} "
+                f"copy={bool(flow.state.copywriting)}")
+
+            # Discovery phase: emit the question as a `message` event (frontend renders this as chat bubble)
+            if phase_before == "discovery" and agent_contents:
+                first_agent, first_content = agent_contents[0]
+                # Strip [SUGGESTIONS] section for display
+                display = first_content.split("[SUGGESTIONS]")[0].strip() if "[SUGGESTIONS]" in first_content else first_content
+                # Also strip [READY] marker
+                display = display.replace("[READY]", "").strip()
+                if display:
+                    yield context.utils.sse({
+                        "type": "message",
+                        "from": "market_analyst",
+                        "content": display,
+                        "phase": "discovery",
+                    })
+
+            # If phase changed during streaming (e.g., discovery → planning), emit final phase
+            if phase != phase_before:
+                yield context.utils.sse({"type": "phase_change", "phase": phase, "progress": _phase_progress(phase)})
+
+            # Emit card updates based on what state has
+            if flow.state.audience_profile:
+                yield context.utils.sse({"type": "card_update", "card": "audience", "data": {"content": flow.state.audience_profile}})
+            if flow.state.brand_creatives:
+                yield context.utils.sse({"type": "card_update", "card": "brand_creative", "data": {"raw": flow.state.brand_creatives}})
+            if flow.state.channel_plan:
+                yield context.utils.sse({"type": "card_update", "card": "channel_plan", "data": {"raw": flow.state.channel_plan}})
+            if flow.state.integrated_strategy:
+                yield context.utils.sse({"type": "card_update", "card": "strategy", "data": {"raw": flow.state.integrated_strategy}})
+            if flow.state.copywriting:
+                yield context.utils.sse({"type": "card_update", "card": "copywriting", "data": {"raw": flow.state.copywriting}})
+
+            # Emit suggestions (discovery phase only)
+            if phase == "discovery" and agent_contents:
+                _, last_content = agent_contents[-1]
+                suggestions = _extract_suggestions(last_content)
+                if suggestions:
+                    yield context.utils.sse({"type": "suggestions", "suggestions": suggestions})
+
+            # Emit actions
+            yield context.utils.sse({"type": "actions", "actions": _get_actions(phase, flow.state, locale)})
+
+            # Sync to store
+            await sync_pending_to_store(cid, store)
+            if pending_writes:
+                await asyncio.gather(*pending_writes, return_exceptions=True)
+            yield context.utils.sse({"type": "done", "status": "completed"})
+
         except Exception as e:
-            log(f"Error: {traceback.format_exc()}")
-            yield _sse(context, {"type": "error", "message": str(e)})
+            log(f"stream error: {e}")
+            yield context.utils.sse({"type": "error", "message": str(e)})
+            await sync_pending_to_store(cid, store)
+            if pending_writes:
+                await asyncio.gather(*pending_writes, return_exceptions=True)
+            yield context.utils.sse({"type": "done", "status": "error"})
 
-        yield _sse(context, {"type": "done"})
-        yield _sse(context, "[DONE]")
-
-    return context.utils.stream_sse(generate_sse())
+    return context.utils.stream_sse(gen())
 
 
-async def _stream_kickoff(body, conversation_id, locale, context):
-    """首次启动 — 直接调用 DiscoveryCrew（与 resume 路径一致）"""
-    campaign_name = body.get("campaign_name", "")
-    campaign_brief = body.get("message", body.get("campaign_brief", ""))
+# ─── Branch action handler ───────────────────────────────────────────
 
-    yield {"type": "phase_change", "phase": "discovery", "progress": 10}
-    yield {"type": "status", "message": "市场分析师正在准备提问..." if locale == "zh" else "Market analyst preparing questions...", "from": "chief_strategist"}
-    yield {"type": "agent_start", "agent": "market_analyst"}
-
-    # 构建初始状态
-    state = CampaignState(
-        campaign_name=campaign_name,
-        campaign_brief=campaign_brief,
-        locale=locale,
-    )
-
+async def _handle_branch_action(message, cid, persistence, locale, context):
+    """Handle redo/rollback actions — direct crew calls, bypass Flow."""
+    action, feedback = _parse_action(message)
     locale_instruction = "Chinese (中文)" if locale == "zh" else "English"
 
-    try:
-        # 复用 build_crew_for_route — 与 resume 路径完全一致
-        crew, _ = build_crew_for_route(state, "discovery_resume", locale_instruction)
-        if crew is None:
-            yield {"type": "error", "message": "无法构建 Discovery Crew"}
-            yield {"type": "agent_end", "agent": "market_analyst"}
-            return
-
-        result = await asyncio.wait_for(crew.kickoff_async(), timeout=300)
-        result_text = str(result)
-
-        # 更新 state（与 resume 路径一致）
-        update_state_after_crew(state, "discovery_resume", result_text)
-
-    except asyncio.TimeoutError:
-        yield {"type": "error", "message": "LLM 响应超时，请重试"}
-        yield {"type": "agent_end", "agent": "market_analyst"}
+    # Load current state from persistence
+    pending = persistence.load_pending_feedback(cid)
+    if not pending:
+        yield {"type": "error", "message": "No pending state found"}
         return
-    except Exception as e:
-        yield {"type": "error", "message": str(e)}
-        yield {"type": "agent_end", "agent": "market_analyst"}
-        return
+    state_data, _ = pending
+    state = CampaignState(**state_data)
 
-    # 输出 agent 产出
-    if state.current_phase != "planning":
-        # 还在 discovery 阶段 — 输出问题
-        display = result_text
-        if "[SUGGESTIONS]" in display:
-            display = display.split("[SUGGESTIONS]")[0].strip()
-        yield {"type": "message", "from": "market_analyst", "content": display, "phase": "discovery"}
-    else:
-        # [READY] 被检测到，已经进入 planning — 输出受众画像卡片
-        yield {"type": "card_update", "card": "audience", "data": {"content": state.audience_profile}}
+    inputs = {
+        "campaign_name": state.campaign_name,
+        "campaign_brief": state.campaign_brief + (f"\n\nFeedback: {feedback}" if feedback else ""),
+        "audience_profile": state.audience_profile,
+        "market_insights": state.market_insights,
+        "locale_instruction": locale_instruction,
+    }
 
-    yield {"type": "agent_end", "agent": "market_analyst"}
+    if action == "redo_brand":
+        yield {"type": "phase_change", "phase": "planning"}
+        yield {"type": "agent_start", "agent": "Brand & Creative Director"}
+        result = BrandCreativeCrew().crew().kickoff(inputs=inputs)
+        state.brand_creatives = _crew_text(result)
+        yield {"type": "agent_end", "agent": "Brand & Creative Director"}
+        yield {"type": "card_update", "card": "brand_creative", "data": {"raw": state.brand_creatives}}
 
-    # 输出卡片更新（如果有受众画像但还未通过上面输出）
-    if state.audience_profile and state.current_phase != "planning":
-        yield {"type": "card_update", "card": "audience", "data": {"content": state.audience_profile}}
+    elif action == "redo_channel":
+        yield {"type": "phase_change", "phase": "planning"}
+        yield {"type": "agent_start", "agent": "Channel & Media Planner"}
+        result = ChannelPlanningCrew().crew().kickoff(inputs=inputs)
+        state.channel_plan = _crew_text(result)
+        yield {"type": "agent_end", "agent": "Channel & Media Planner"}
+        yield {"type": "card_update", "card": "channel_plan", "data": {"raw": state.channel_plan}}
 
-    # 如果 discovery 判断 READY，自动继续执行 planning crew
-    if state.current_phase == "planning":
-        yield {"type": "phase_change", "phase": "planning", "progress": phase_to_progress("planning")}
-        yield {"type": "status", "message": "信息收集完毕，开始策划..." if locale == "zh" else "Research complete, starting parallel planning...", "from": "chief_strategist"}
-        yield {"type": "parallel_start", "lanes": ["brand", "channel"]}
-
-        # 品牌创意流式
-        yield {"type": "agent_start", "agent": "brand_creative_director", "lane": "brand"}
-        try:
-            async for event in execute_crew_streaming(state, "planning"):
-                yield event
-        except Exception as e:
-            log(f"Planning brand error: {traceback.format_exc()}")
-            yield {"type": "error", "message": str(e)}
-            save_state(conversation_id, state.model_dump(), {"phase": "planning"})
-            return
-        yield {"type": "agent_end", "agent": "brand_creative_director", "lane": "brand"}
-        yield {"type": "card_update", "card": "brand_creative", "data": {"creatives": state.brand_creatives}}
-
-        # 渠道策略流式
-        yield {"type": "agent_start", "agent": "channel_planner", "lane": "channel"}
-        try:
-            async for event in execute_crew_streaming(state, "planning_channel"):
-                yield event
-        except Exception as e:
-            log(f"Planning channel error: {traceback.format_exc()}")
-            yield {"type": "error", "message": str(e)}
-            save_state(conversation_id, state.model_dump(), {"phase": "planning"})
-            return
-        yield {"type": "agent_end", "agent": "channel_planner", "lane": "channel"}
-        yield {"type": "card_update", "card": "channel_plan", "data": {"plan": state.channel_plan}}
-
-        yield {"type": "parallel_end"}
-
-    # 输出推荐回答（仅 discovery 阶段）
-    if state.current_phase != "planning":
-        suggestions = generate_suggestions(state, locale)
-        if suggestions:
-            yield {"type": "suggestions", "suggestions": suggestions}
-
-    # 输出可用操作
-    phase = state.current_phase if state.current_phase == "planning" else "discovery"
-    yield {"type": "actions", "actions": get_actions_for_phase(phase, state, locale)}
-
-    # 保存状态
-    save_state(conversation_id, state.model_dump(), {"phase": state.current_phase})
-    await persist_to_store(context, conversation_id, state)
-    await save_messages_to_store(context, conversation_id, state)
-
-
-async def _stream_resume(body, stored, conversation_id, context):
-    """恢复暂停的对话 - 根据路由直接调用对应 Crew"""
-    state_dict = stored["state"]
-    phase = state_dict.get("current_phase", "discovery")
-    locale = state_dict.get("locale", "zh")
-
-    # 恢复 state
-    state = CampaignState(**state_dict)
-
-    # 根据请求类型确定下一步
-    next_route = determine_next_route(body, state, phase)
-
-    if next_route == "done":
-        delete_state(conversation_id)
-        yield {"type": "phase_change", "phase": "done", "progress": 100}
-        yield {"type": "status", "message": "营销方案已完成！" if locale == "zh" else "Campaign plan complete!", "from": "chief_strategist"}
-        return
-
-    if next_route == "wait":
-        save_state(conversation_id, state.model_dump(), {"phase": phase})
-        yield {"type": "status", "message": "已保存" if locale == "zh" else "Saved", "from": "chief_strategist"}
-        return
-
-    # Rollback：只切换阶段，恢复已有数据，不清除下游（redo 才清除）
-    if next_route == "rollback_to_planning":
+    elif action == "rollback_to_planning":
         state.current_phase = "planning"
-        state.brand_confirmed = False
-        state.channel_confirmed = False
-        save_state(conversation_id, state.model_dump(), {"phase": "planning"})
-        yield {"type": "phase_change", "phase": "planning", "progress": phase_to_progress("planning")}
-        yield {"type": "status", "message": "已返回方案策划阶段" if locale == "zh" else "Back to planning", "from": "chief_strategist"}
-        yield {"type": "card_update", "card": "brand_creative", "data": {"creatives": state.brand_creatives}}
-        yield {"type": "card_update", "card": "channel_plan", "data": {"plan": state.channel_plan}}
-        yield {"type": "actions", "actions": get_actions_for_phase("planning", state, locale)}
-        return
+        yield {"type": "phase_change", "phase": "planning"}
+        yield {"type": "card_update", "card": "brand_creative", "data": {"raw": state.brand_creatives}}
+        yield {"type": "card_update", "card": "channel_plan", "data": {"raw": state.channel_plan}}
 
-    if next_route == "rollback_to_integration":
+    elif action == "rollback_to_integration":
         state.current_phase = "integration"
-        save_state(conversation_id, state.model_dump(), {"phase": "integration"})
-        yield {"type": "phase_change", "phase": "integration", "progress": phase_to_progress("integration")}
-        yield {"type": "status", "message": "已返回策略整合阶段" if locale == "zh" else "Back to integration", "from": "chief_strategist"}
-        yield {"type": "card_update", "card": "strategy", "data": {"content": state.integrated_strategy}}
-        yield {"type": "actions", "actions": get_actions_for_phase("integration", state, locale)}
-        return
-
-    # Restore：前进到已有数据的阶段（回退后再确认时不重新生成）
-    if next_route == "restore_integration":
-        state.current_phase = "integration"
-        save_state(conversation_id, state.model_dump(), {"phase": "integration"})
-        yield {"type": "phase_change", "phase": "integration", "progress": phase_to_progress("integration")}
-        yield {"type": "status", "message": "策略整合方案已就绪" if locale == "zh" else "Strategy ready", "from": "chief_strategist"}
-        yield {"type": "card_update", "card": "strategy", "data": {"content": state.integrated_strategy}}
-        yield {"type": "actions", "actions": get_actions_for_phase("integration", state, locale)}
-        return
-
-    if next_route == "restore_content":
-        state.current_phase = "content"
-        save_state(conversation_id, state.model_dump(), {"phase": "content"})
-        yield {"type": "phase_change", "phase": "content", "progress": phase_to_progress("content")}
-        yield {"type": "status", "message": "营销文案已就绪" if locale == "zh" else "Copy ready", "from": "chief_strategist"}
-        yield {"type": "card_update", "card": "copywriting", "data": {"content": state.copywriting}}
-        yield {"type": "actions", "actions": get_actions_for_phase("content", state, locale)}
-        return
-
-    # Finalize：展示卡片总览（发送所有卡片数据确保前端状态完整）
-    if next_route == "finalize":
-        state.current_phase = "finalize"
-        save_state(conversation_id, state.model_dump(), {"phase": "finalize"})
-        yield {"type": "phase_change", "phase": "finalize", "progress": phase_to_progress("finalize")}
-        yield {"type": "status", "message": "所有模块已完成，可以生成完整方案" if locale == "zh" else "All modules ready, generate full plan", "from": "chief_strategist"}
-        # 发送所有卡片数据
-        yield {"type": "card_update", "card": "audience", "data": {"content": state.audience_profile}}
-        yield {"type": "card_update", "card": "brand_creative", "data": {"creatives": state.brand_creatives}}
-        yield {"type": "card_update", "card": "channel_plan", "data": {"plan": state.channel_plan}}
+        yield {"type": "phase_change", "phase": "integration"}
         yield {"type": "card_update", "card": "strategy", "data": {"raw": state.integrated_strategy}}
-        yield {"type": "card_update", "card": "copywriting", "data": state.copywriting if isinstance(state.copywriting, dict) else {"raw": str(state.copywriting)}}
-        return
 
-    # 生成完整方案文档（流式）
-    if next_route == "generate_document" or next_route == "revise_document":
-        state.current_phase = "finalize"
-        yield {"type": "phase_change", "phase": "finalize", "progress": phase_to_progress("finalize")}
-        msg = ("策略总监正在修订方案..." if next_route == "revise_document" else "策略总监正在整合生成完整方案...") if locale == "zh" else ("Revising plan..." if next_route == "revise_document" else "Generating full plan...")
-        yield {"type": "status", "message": msg, "from": "chief_strategist"}
-        yield {"type": "agent_start", "agent": "chief_strategist"}
-        try:
-            async for event in execute_crew_streaming(state, next_route):
-                yield event
-        except Exception as e:
-            log(f"Document error: {traceback.format_exc()}")
-            yield {"type": "error", "message": str(e)}
-        yield {"type": "agent_end", "agent": "chief_strategist"}
-        save_state(conversation_id, state.model_dump(), {"phase": "finalize"})
-        return
-
-    # Rollback to content
-    if next_route == "rollback_to_content":
+    elif action == "rollback_to_content":
         state.current_phase = "content"
-        save_state(conversation_id, state.model_dump(), {"phase": "content"})
-        yield {"type": "phase_change", "phase": "content", "progress": phase_to_progress("content")}
-        yield {"type": "status", "message": "已返回内容产出阶段" if locale == "zh" else "Back to content", "from": "chief_strategist"}
-        yield {"type": "card_update", "card": "copywriting", "data": {"raw": state.copywriting.get("raw", "") if isinstance(state.copywriting, dict) else str(state.copywriting)}}
-        yield {"type": "actions", "actions": get_actions_for_phase("content", state, locale)}
-        return
+        yield {"type": "phase_change", "phase": "content"}
+        yield {"type": "card_update", "card": "copywriting", "data": {"raw": state.copywriting}}
 
-    # 发送阶段变更
-    new_phase = route_to_phase(next_route)
-    progress = phase_to_progress(new_phase)
-    yield {"type": "phase_change", "phase": new_phase, "progress": progress}
+    # Save updated state back to persistence (keeps Flow pending context intact)
+    from crewai.flow.async_feedback.types import PendingFeedbackContext
+    pending_ctx = pending[1] if pending else PendingFeedbackContext(
+        method_name="planning_step", message="(user reviews)"
+    )
+    persistence.save_pending_feedback(cid, pending_ctx, state.model_dump())
 
-    # 发送状态提示
-    status_msg = get_status_message(next_route, locale)
-    if status_msg:
-        yield {"type": "status", "message": status_msg, "from": "chief_strategist"}
+    yield {"type": "actions", "actions": _get_actions(state.current_phase, state, locale)}
 
-    # 发送 agent_start
-    agent = route_to_agent(next_route)
-    if agent:
-        yield {"type": "agent_start", "agent": agent, "lane": route_to_lane(next_route)}
 
-    # 执行 Crew（流式）
-    if next_route == "planning":
-        # 并行：先品牌流式，再渠道流式
-        yield {"type": "parallel_start", "lanes": ["brand", "channel"]}
-        try:
-            async for event in execute_crew_streaming(state, "planning"):
-                yield event
-            yield {"type": "agent_end", "agent": "brand_creative_director", "lane": "brand"}
-            # 发送品牌卡片
-            yield {"type": "card_update", "card": "brand_creative", "data": {"creatives": state.brand_creatives}}
+# ─── History handler ─────────────────────────────────────────────────
 
-            # 渠道
-            yield {"type": "agent_start", "agent": "channel_planner", "lane": "channel"}
-            async for event in execute_crew_streaming(state, "planning_channel"):
-                yield event
-            yield {"type": "agent_end", "agent": "channel_planner", "lane": "channel"}
-            yield {"type": "card_update", "card": "channel_plan", "data": {"plan": state.channel_plan}}
-        except Exception as e:
-            log(f"Planning crew error: {traceback.format_exc()}")
-            yield {"type": "error", "message": str(e)}
-            save_state(conversation_id, state.model_dump(), {"phase": "planning"})
-            return
-        yield {"type": "parallel_end"}
-    elif next_route == "delivery":
-        # delivery 不执行 crew，直接输出所有卡片
-        yield {"type": "card_update", "card": "audience", "data": {"content": state.audience_profile}}
-        yield {"type": "card_update", "card": "brand_creative", "data": {"creatives": state.brand_creatives}}
-        yield {"type": "card_update", "card": "channel_plan", "data": {"plan": state.channel_plan}}
-        yield {"type": "card_update", "card": "strategy", "data": {"content": state.integrated_strategy}}
-        yield {"type": "card_update", "card": "copywriting", "data": {"content": state.copywriting}}
-    elif next_route == "discovery_resume":
-        # discovery 不流式：执行 crew 后一次性发送结果
-        try:
-            crew, _ = build_crew_for_route(state, "discovery_resume", "Chinese (中文)" if locale == "zh" else "English")
-            if crew:
-                result = await asyncio.wait_for(crew.kickoff_async(), timeout=300)
-                result_text = str(result)
-                update_state_after_crew(state, "discovery_resume", result_text)
-                # 输出问题（去掉 SUGGESTIONS）
-                if state.current_phase != "planning":
-                    display = result_text
-                    if "[SUGGESTIONS]" in display:
-                        display = display.split("[SUGGESTIONS]")[0].strip()
-                    yield {"type": "message", "from": "market_analyst", "content": display, "phase": "discovery"}
-                else:
-                    # READY 了，输出受众画像卡片
-                    yield {"type": "card_update", "card": "audience", "data": {"content": state.audience_profile}}
-        except Exception as e:
-            log(f"Discovery crew error: {traceback.format_exc()}")
-            yield {"type": "error", "message": str(e)}
-            if agent:
-                yield {"type": "agent_end", "agent": agent, "lane": route_to_lane(next_route)}
-            return
-    else:
-        # 其他路由：流式执行
-        # 先清空前端对应卡片（避免新 chunk 追加在旧内容后面）
-        clear_card_map = {
-            "integration": "strategy",
-            "content": "copywriting",
-            "redo_brand": "brand_creative",
-            "redo_channel": "channel_plan",
+async def _handle_history(context, body):
+    """Return conversation history from context.store."""
+    conversation_id = getattr(context, "conversation_id", "") or body.get("conversation_id", "")
+    if not conversation_id:
+        return {"conversation_id": "", "chat_history": [], "current_phase": "start"}
+
+    try:
+        messages = await context.store.get_messages(
+            conversation_id=conversation_id, limit=100, order="asc"
+        )
+        chat_history = []
+        for m in messages:
+            meta_data = m.metadata or {}
+            agent = meta_data.get("agent", m.role)
+            chat_history.append({"role": agent, "content": m.content})
+
+        # Try to determine phase from persistence
+        persistence = get_persistence()
+        pending = persistence.load_pending_feedback(conversation_id)
+        if pending:
+            state_data = pending[0]
+            current_phase = state_data.get("current_phase", "discovery")
+        else:
+            current_phase = "discovery" if chat_history else "start"
+
+        return {
+            "conversation_id": conversation_id,
+            "chat_history": chat_history,
+            "current_phase": current_phase,
         }
-        clear_card = clear_card_map.get(next_route)
-        if clear_card:
-            yield {"type": "card_update", "card": clear_card, "data": {"raw": ""}}
-
-        try:
-            async for event in execute_crew_streaming(state, next_route):
-                yield event
-        except Exception as e:
-            log(f"Crew execution error: {traceback.format_exc()}")
-            yield {"type": "error", "message": str(e)}
-            if agent:
-                yield {"type": "agent_end", "agent": agent, "lane": route_to_lane(next_route)}
-            return
-
-        # 流式 chunk 已经将内容推送到前端 cards.raw，不需要再发 card_update
-
-    # discovery_resume 且未进入 planning 时，附加推荐回答
-    if next_route == "discovery_resume" and state.current_phase != "planning":
-        suggestions = generate_suggestions(state, locale)
-        if suggestions:
-            yield {"type": "suggestions", "suggestions": suggestions}
-
-    if agent and next_route != "planning":
-        yield {"type": "agent_end", "agent": agent, "lane": route_to_lane(next_route)}
-
-    # 如果 discovery_resume 中 Crew 判断 READY，state.current_phase 已被改为 planning
-    # 需要自动继续执行 planning crew
-    if state.current_phase == "planning" and next_route == "discovery_resume":
-        yield {"type": "phase_change", "phase": "planning", "progress": phase_to_progress("planning")}
-        yield {"type": "status", "message": "信息收集完毕，开始策划..." if locale == "zh" else "Research complete, starting parallel planning...", "from": "chief_strategist"}
-        yield {"type": "parallel_start", "lanes": ["brand", "channel"]}
-
-        # 品牌创意流式
-        yield {"type": "agent_start", "agent": "brand_creative_director", "lane": "brand"}
-        try:
-            async for event in execute_crew_streaming(state, "planning"):
-                yield event
-        except Exception as e:
-            log(f"Planning brand error: {traceback.format_exc()}")
-            yield {"type": "error", "message": str(e)}
-            save_state(conversation_id, state.model_dump(), {"phase": "planning"})
-            return
-        yield {"type": "agent_end", "agent": "brand_creative_director", "lane": "brand"}
-        yield {"type": "card_update", "card": "brand_creative", "data": {"creatives": state.brand_creatives}}
-
-        # 渠道策略流式
-        yield {"type": "agent_start", "agent": "channel_planner", "lane": "channel"}
-        try:
-            async for event in execute_crew_streaming(state, "planning_channel"):
-                yield event
-        except Exception as e:
-            log(f"Planning channel error: {traceback.format_exc()}")
-            yield {"type": "error", "message": str(e)}
-            save_state(conversation_id, state.model_dump(), {"phase": "planning"})
-            return
-        yield {"type": "agent_end", "agent": "channel_planner", "lane": "channel"}
-        yield {"type": "card_update", "card": "channel_plan", "data": {"plan": state.channel_plan}}
-
-        yield {"type": "parallel_end"}
-        new_phase = "planning"
-    else:
-        state.current_phase = new_phase
-
-    save_state(conversation_id, state.model_dump(), {"phase": state.current_phase})
-    await persist_to_store(context, conversation_id, state)
-
-    # 输出操作按钮
-    yield {"type": "actions", "actions": get_actions_for_phase(new_phase, state, locale)}
+    except Exception:
+        return {"conversation_id": conversation_id, "chat_history": [], "current_phase": "start"}
 
 
+# ─── Utility functions ───────────────────────────────────────────────
+
+def _phase_progress(phase: str) -> int:
+    return {
+        "discovery": 10,
+        "planning": 30,
+        "integration": 55,
+        "content": 75,
+        "finalize": 95,
+    }.get(phase, 0)
+
+
+def _extract_suggestions(text: str) -> list[str]:
+    """Extract [SUGGESTIONS] section from discovery output."""
+    if "[SUGGESTIONS]" not in text:
+        return []
+    parts = text.split("[SUGGESTIONS]", 1)
+    if len(parts) < 2:
+        return []
+    suggestions = []
+    for line in parts[1].strip().split("\n"):
+        line = line.strip()
+        if line.startswith("- "):
+            suggestions.append(line[2:].strip())
+        elif line:
+            suggestions.append(line)
+    return suggestions[:3]
+
+
+def _get_actions(phase: str, state, locale: str) -> list[dict]:
+    """Generate available actions for current phase."""
+    zh = locale == "zh"
+    actions = []
+
+    if phase == "discovery":
+        pass  # Just reply to continue
+
+    elif phase == "planning":
+        actions = [
+            {"id": "ACTION:confirm", "label": "确认方案，继续" if zh else "Confirm & Continue"},
+            {"id": "ACTION:redo_brand", "label": "重新生成品牌创意" if zh else "Redo Brand Creative"},
+            {"id": "ACTION:redo_channel", "label": "重新生成渠道策略" if zh else "Redo Channel Strategy"},
+        ]
+
+    elif phase == "integration":
+        actions = [
+            {"id": "ACTION:confirm", "label": "确认，继续" if zh else "Confirm & Continue"},
+            {"id": "ACTION:rollback_to_planning", "label": "返回方案策划" if zh else "Back to Planning"},
+        ]
+
+    elif phase == "content":
+        actions = [
+            {"id": "ACTION:confirm", "label": "确认，完成" if zh else "Confirm & Finish"},
+            {"id": "ACTION:rollback_to_integration", "label": "返回策略整合" if zh else "Back to Integration"},
+        ]
+
+    elif phase == "finalize":
+        actions = [
+            {"id": "ACTION:generate_document", "label": "生成完整方案" if zh else "Generate Full Plan"},
+        ]
+        if state.integrated_strategy and len(state.integrated_strategy) > 500:
+            actions.append(
+                {"id": "ACTION:revise_document", "label": "修改方案" if zh else "Revise Plan"}
+            )
+
+    return actions
+
+
+def _agent_to_lane(agent_role: str) -> str:
+    """Map agent role to parallel lane name (for planning phase UI)."""
+    agent_id = _normalize_agent(agent_role)
+    if agent_id == "brand_creative_director":
+        return "brand"
+    if agent_id == "channel_planner":
+        return "channel"
+    return ""
+
+
+def _normalize_agent(agent_role: str) -> str:
+    """Map CrewAI agent role string to frontend agent_id.
+
+    Frontend expects: market_analyst, brand_creative_director, channel_planner,
+    chief_strategist, copywriter.
+    CrewAI sends the 'role' field from agents.yaml which is a human-readable string.
+    """
+    if not agent_role:
+        return ""
+    lower = agent_role.lower().strip()
+    if "market" in lower and ("analyst" in lower or "research" in lower):
+        return "market_analyst"
+    if "brand" in lower or "creative director" in lower:
+        return "brand_creative_director"
+    if "channel" in lower or "media" in lower:
+        return "channel_planner"
+    if "strategist" in lower or "chief" in lower:
+        return "chief_strategist"
+    if "copywriter" in lower or "copy" in lower:
+        return "copywriter"
+    return agent_role

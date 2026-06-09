@@ -29,6 +29,11 @@ export default function IntegrationView({ cards, streaming, activeAgents, onActi
     onAction("confirm", feedback)
   }, [onAction])
 
+  const handleAcceptNew = useCallback(() => {
+    // Just accept the new version (clear compare mode), don't advance
+    setPreviousStrategy(null)
+  }, [])
+
   const handleKeepOld = useCallback(() => {
     if (previousStrategy) {
       onAction("keep_old", previousStrategy)
@@ -75,7 +80,7 @@ export default function IntegrationView({ cards, streaming, activeAgents, onActi
           oldContent={previousStrategy}
           newContent={content || ""}
           loading={isLoading}
-          onAcceptNew={() => handleConfirm()}
+          onAcceptNew={handleAcceptNew}
           onKeepOld={handleKeepOld}
           onReviseAgain={(fb) => handleRedo(fb)}
         />

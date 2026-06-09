@@ -3,16 +3,14 @@ POST /stream - 营销活动策划 Agent 主入口
 
 处理所有对话轮次：
 - action: "history" → 返回存储的历史
-- action: "send" → kickoff 或 resume Flow
+- action: "send" → kickoff 或 resume
 """
 import uuid
 import asyncio
 import traceback
 
 from agents._lib.state import CampaignState
-from agents._lib.flow import MarketingCampaignFlow
-from agents._lib.feedback_provider import HumanFeedbackPending
-from agents._lib.persistence import save_flow_state, load_flow_state, delete_flow_state
+from agents._lib.persistence import save_state, load_state, delete_state
 from agents._lib.logger import make_logger
 from agents._lib.store_utils import persist_to_store, save_messages_to_store
 from agents._lib.router import determine_next_route
@@ -87,7 +85,7 @@ async def _handle_history(context, body):
                     "iteration_count": 0,
                     "finished": False,
                 }
-                save_flow_state(conversation_id, state_dict, {"phase": current_phase})
+                save_state(conversation_id, state_dict, {"phase": current_phase})
 
                 return {
                     "conversation_id": conversation_id,
@@ -99,7 +97,7 @@ async def _handle_history(context, body):
             pass
 
     # 回退到内存 state
-    stored = load_flow_state(conversation_id)
+    stored = load_state(conversation_id)
     if stored and stored.get("state"):
         state = stored["state"]
         return {
@@ -122,7 +120,7 @@ async def _handle_send(context, body):
     conversation_id = body.get("conversation_id", str(uuid.uuid4()))
     locale = body.get("locale", "zh")
 
-    stored = load_flow_state(conversation_id)
+    stored = load_state(conversation_id)
 
     # 如果内存没有但 context.store 有，自动恢复（处理多实例/重启场景）
     if stored is None and hasattr(context, "store") and body.get("conversation_id"):
@@ -153,8 +151,8 @@ async def _handle_send(context, body):
                     "iteration_count": 0,
                     "finished": False,
                 }
-                save_flow_state(conversation_id, state_dict, {"phase": current_phase})
-                stored = load_flow_state(conversation_id)
+                save_state(conversation_id, state_dict, {"phase": current_phase})
+                stored = load_state(conversation_id)
         except Exception:
             pass
 
@@ -187,7 +185,7 @@ async def _handle_send(context, body):
 
 
 async def _stream_kickoff(body, conversation_id, locale, context):
-    """首次启动 Flow"""
+    """首次启动 — 直接调用 DiscoveryCrew（与 resume 路径一致）"""
     campaign_name = body.get("campaign_name", "")
     campaign_brief = body.get("message", body.get("campaign_brief", ""))
 
@@ -195,54 +193,107 @@ async def _stream_kickoff(body, conversation_id, locale, context):
     yield {"type": "status", "message": "市场分析师正在准备提问..." if locale == "zh" else "Market analyst preparing questions...", "from": "chief_strategist"}
     yield {"type": "agent_start", "agent": "market_analyst"}
 
-    flow = MarketingCampaignFlow()
-    flow.state.campaign_name = campaign_name
-    flow.state.campaign_brief = campaign_brief
-    flow.state.locale = locale
+    # 构建初始状态
+    state = CampaignState(
+        campaign_name=campaign_name,
+        campaign_brief=campaign_brief,
+        locale=locale,
+    )
+
+    locale_instruction = "Chinese (中文)" if locale == "zh" else "English"
 
     try:
-        await asyncio.wait_for(flow.kickoff_async(), timeout=300)
+        # 复用 build_crew_for_route — 与 resume 路径完全一致
+        crew, _ = build_crew_for_route(state, "discovery_resume", locale_instruction)
+        if crew is None:
+            yield {"type": "error", "message": "无法构建 Discovery Crew"}
+            yield {"type": "agent_end", "agent": "market_analyst"}
+            return
+
+        result = await asyncio.wait_for(crew.kickoff_async(), timeout=300)
+        result_text = str(result)
+
+        # 更新 state（与 resume 路径一致）
+        update_state_after_crew(state, "discovery_resume", result_text)
+
     except asyncio.TimeoutError:
         yield {"type": "error", "message": "LLM 响应超时，请重试"}
         yield {"type": "agent_end", "agent": "market_analyst"}
         return
-    except HumanFeedbackPending as e:
-        # Flow 暂停 - 保存状态（内存）
-        save_flow_state(conversation_id, flow.state.model_dump(), e.context)
-
-        # 输出最新的 agent 产出
-        if flow.state.chat_history:
-            last_msg = flow.state.chat_history[-1]
-            content = last_msg.get("content", "")
-            if "[SUGGESTIONS]" in content:
-                content = content.split("[SUGGESTIONS]")[0].strip()
-            yield {"type": "message", "from": last_msg.get("role", "market_analyst"), "content": content, "phase": "discovery"}
-
+    except Exception as e:
+        yield {"type": "error", "message": str(e)}
         yield {"type": "agent_end", "agent": "market_analyst"}
+        return
 
-        # 输出卡片更新
-        if flow.state.audience_profile:
-            yield {"type": "card_update", "card": "audience", "data": {"content": flow.state.audience_profile}}
+    # 输出 agent 产出
+    if state.current_phase != "planning":
+        # 还在 discovery 阶段 — 输出问题
+        display = result_text
+        if "[SUGGESTIONS]" in display:
+            display = display.split("[SUGGESTIONS]")[0].strip()
+        yield {"type": "message", "from": "market_analyst", "content": display, "phase": "discovery"}
+    else:
+        # [READY] 被检测到，已经进入 planning — 输出受众画像卡片
+        yield {"type": "card_update", "card": "audience", "data": {"content": state.audience_profile}}
 
-        # 输出推荐回答
-        suggestions = generate_suggestions(flow.state, locale)
+    yield {"type": "agent_end", "agent": "market_analyst"}
+
+    # 输出卡片更新（如果有受众画像但还未通过上面输出）
+    if state.audience_profile and state.current_phase != "planning":
+        yield {"type": "card_update", "card": "audience", "data": {"content": state.audience_profile}}
+
+    # 如果 discovery 判断 READY，自动继续执行 planning crew
+    if state.current_phase == "planning":
+        yield {"type": "phase_change", "phase": "planning", "progress": phase_to_progress("planning")}
+        yield {"type": "status", "message": "信息收集完毕，开始策划..." if locale == "zh" else "Research complete, starting parallel planning...", "from": "chief_strategist"}
+        yield {"type": "parallel_start", "lanes": ["brand", "channel"]}
+
+        # 品牌创意流式
+        yield {"type": "agent_start", "agent": "brand_creative_director", "lane": "brand"}
+        try:
+            async for event in execute_crew_streaming(state, "planning"):
+                yield event
+        except Exception as e:
+            log(f"Planning brand error: {traceback.format_exc()}")
+            yield {"type": "error", "message": str(e)}
+            save_state(conversation_id, state.model_dump(), {"phase": "planning"})
+            return
+        yield {"type": "agent_end", "agent": "brand_creative_director", "lane": "brand"}
+        yield {"type": "card_update", "card": "brand_creative", "data": {"creatives": state.brand_creatives}}
+
+        # 渠道策略流式
+        yield {"type": "agent_start", "agent": "channel_planner", "lane": "channel"}
+        try:
+            async for event in execute_crew_streaming(state, "planning_channel"):
+                yield event
+        except Exception as e:
+            log(f"Planning channel error: {traceback.format_exc()}")
+            yield {"type": "error", "message": str(e)}
+            save_state(conversation_id, state.model_dump(), {"phase": "planning"})
+            return
+        yield {"type": "agent_end", "agent": "channel_planner", "lane": "channel"}
+        yield {"type": "card_update", "card": "channel_plan", "data": {"plan": state.channel_plan}}
+
+        yield {"type": "parallel_end"}
+
+    # 输出推荐回答（仅 discovery 阶段）
+    if state.current_phase != "planning":
+        suggestions = generate_suggestions(state, locale)
         if suggestions:
             yield {"type": "suggestions", "suggestions": suggestions}
 
-        # 输出可用操作
-        phase = e.context.get("phase", "discovery") if e.context else "discovery"
-        yield {"type": "actions", "actions": get_actions_for_phase(phase, flow.state, locale)}
+    # 输出可用操作
+    phase = state.current_phase if state.current_phase == "planning" else "discovery"
+    yield {"type": "actions", "actions": get_actions_for_phase(phase, state, locale)}
 
-        # 持久化到 context.store（所有输出完成后）
-        await persist_to_store(context, conversation_id, flow.state)
-        await save_messages_to_store(context, conversation_id, flow.state)
-
-    except Exception as e:
-        yield {"type": "error", "message": str(e)}
+    # 保存状态
+    save_state(conversation_id, state.model_dump(), {"phase": state.current_phase})
+    await persist_to_store(context, conversation_id, state)
+    await save_messages_to_store(context, conversation_id, state)
 
 
 async def _stream_resume(body, stored, conversation_id, context):
-    """恢复暂停的 Flow - 直接调用 Crew 而非 Flow methods"""
+    """恢复暂停的对话 - 根据路由直接调用对应 Crew"""
     state_dict = stored["state"]
     phase = state_dict.get("current_phase", "discovery")
     locale = state_dict.get("locale", "zh")
@@ -254,13 +305,13 @@ async def _stream_resume(body, stored, conversation_id, context):
     next_route = determine_next_route(body, state, phase)
 
     if next_route == "done":
-        delete_flow_state(conversation_id)
+        delete_state(conversation_id)
         yield {"type": "phase_change", "phase": "done", "progress": 100}
         yield {"type": "status", "message": "营销方案已完成！" if locale == "zh" else "Campaign plan complete!", "from": "chief_strategist"}
         return
 
     if next_route == "wait":
-        save_flow_state(conversation_id, state.model_dump(), {"phase": phase})
+        save_state(conversation_id, state.model_dump(), {"phase": phase})
         yield {"type": "status", "message": "已保存" if locale == "zh" else "Saved", "from": "chief_strategist"}
         return
 
@@ -269,7 +320,7 @@ async def _stream_resume(body, stored, conversation_id, context):
         state.current_phase = "planning"
         state.brand_confirmed = False
         state.channel_confirmed = False
-        save_flow_state(conversation_id, state.model_dump(), {"phase": "planning"})
+        save_state(conversation_id, state.model_dump(), {"phase": "planning"})
         yield {"type": "phase_change", "phase": "planning", "progress": phase_to_progress("planning")}
         yield {"type": "status", "message": "已返回方案策划阶段" if locale == "zh" else "Back to planning", "from": "chief_strategist"}
         yield {"type": "card_update", "card": "brand_creative", "data": {"creatives": state.brand_creatives}}
@@ -279,7 +330,7 @@ async def _stream_resume(body, stored, conversation_id, context):
 
     if next_route == "rollback_to_integration":
         state.current_phase = "integration"
-        save_flow_state(conversation_id, state.model_dump(), {"phase": "integration"})
+        save_state(conversation_id, state.model_dump(), {"phase": "integration"})
         yield {"type": "phase_change", "phase": "integration", "progress": phase_to_progress("integration")}
         yield {"type": "status", "message": "已返回策略整合阶段" if locale == "zh" else "Back to integration", "from": "chief_strategist"}
         yield {"type": "card_update", "card": "strategy", "data": {"content": state.integrated_strategy}}
@@ -289,7 +340,7 @@ async def _stream_resume(body, stored, conversation_id, context):
     # Restore：前进到已有数据的阶段（回退后再确认时不重新生成）
     if next_route == "restore_integration":
         state.current_phase = "integration"
-        save_flow_state(conversation_id, state.model_dump(), {"phase": "integration"})
+        save_state(conversation_id, state.model_dump(), {"phase": "integration"})
         yield {"type": "phase_change", "phase": "integration", "progress": phase_to_progress("integration")}
         yield {"type": "status", "message": "策略整合方案已就绪" if locale == "zh" else "Strategy ready", "from": "chief_strategist"}
         yield {"type": "card_update", "card": "strategy", "data": {"content": state.integrated_strategy}}
@@ -298,7 +349,7 @@ async def _stream_resume(body, stored, conversation_id, context):
 
     if next_route == "restore_content":
         state.current_phase = "content"
-        save_flow_state(conversation_id, state.model_dump(), {"phase": "content"})
+        save_state(conversation_id, state.model_dump(), {"phase": "content"})
         yield {"type": "phase_change", "phase": "content", "progress": phase_to_progress("content")}
         yield {"type": "status", "message": "营销文案已就绪" if locale == "zh" else "Copy ready", "from": "chief_strategist"}
         yield {"type": "card_update", "card": "copywriting", "data": {"content": state.copywriting}}
@@ -308,7 +359,7 @@ async def _stream_resume(body, stored, conversation_id, context):
     # Finalize：展示卡片总览（发送所有卡片数据确保前端状态完整）
     if next_route == "finalize":
         state.current_phase = "finalize"
-        save_flow_state(conversation_id, state.model_dump(), {"phase": "finalize"})
+        save_state(conversation_id, state.model_dump(), {"phase": "finalize"})
         yield {"type": "phase_change", "phase": "finalize", "progress": phase_to_progress("finalize")}
         yield {"type": "status", "message": "所有模块已完成，可以生成完整方案" if locale == "zh" else "All modules ready, generate full plan", "from": "chief_strategist"}
         # 发送所有卡片数据
@@ -333,13 +384,13 @@ async def _stream_resume(body, stored, conversation_id, context):
             log(f"Document error: {traceback.format_exc()}")
             yield {"type": "error", "message": str(e)}
         yield {"type": "agent_end", "agent": "chief_strategist"}
-        save_flow_state(conversation_id, state.model_dump(), {"phase": "finalize"})
+        save_state(conversation_id, state.model_dump(), {"phase": "finalize"})
         return
 
     # Rollback to content
     if next_route == "rollback_to_content":
         state.current_phase = "content"
-        save_flow_state(conversation_id, state.model_dump(), {"phase": "content"})
+        save_state(conversation_id, state.model_dump(), {"phase": "content"})
         yield {"type": "phase_change", "phase": "content", "progress": phase_to_progress("content")}
         yield {"type": "status", "message": "已返回内容产出阶段" if locale == "zh" else "Back to content", "from": "chief_strategist"}
         yield {"type": "card_update", "card": "copywriting", "data": {"raw": state.copywriting.get("raw", "") if isinstance(state.copywriting, dict) else str(state.copywriting)}}
@@ -381,7 +432,7 @@ async def _stream_resume(body, stored, conversation_id, context):
         except Exception as e:
             log(f"Planning crew error: {traceback.format_exc()}")
             yield {"type": "error", "message": str(e)}
-            save_flow_state(conversation_id, state.model_dump(), {"phase": "planning"})
+            save_state(conversation_id, state.model_dump(), {"phase": "planning"})
             return
         yield {"type": "parallel_end"}
     elif next_route == "delivery":
@@ -463,7 +514,7 @@ async def _stream_resume(body, stored, conversation_id, context):
         except Exception as e:
             log(f"Planning brand error: {traceback.format_exc()}")
             yield {"type": "error", "message": str(e)}
-            save_flow_state(conversation_id, state.model_dump(), {"phase": "planning"})
+            save_state(conversation_id, state.model_dump(), {"phase": "planning"})
             return
         yield {"type": "agent_end", "agent": "brand_creative_director", "lane": "brand"}
         yield {"type": "card_update", "card": "brand_creative", "data": {"creatives": state.brand_creatives}}
@@ -476,7 +527,7 @@ async def _stream_resume(body, stored, conversation_id, context):
         except Exception as e:
             log(f"Planning channel error: {traceback.format_exc()}")
             yield {"type": "error", "message": str(e)}
-            save_flow_state(conversation_id, state.model_dump(), {"phase": "planning"})
+            save_state(conversation_id, state.model_dump(), {"phase": "planning"})
             return
         yield {"type": "agent_end", "agent": "channel_planner", "lane": "channel"}
         yield {"type": "card_update", "card": "channel_plan", "data": {"plan": state.channel_plan}}
@@ -486,7 +537,7 @@ async def _stream_resume(body, stored, conversation_id, context):
     else:
         state.current_phase = new_phase
 
-    save_flow_state(conversation_id, state.model_dump(), {"phase": state.current_phase})
+    save_state(conversation_id, state.model_dump(), {"phase": state.current_phase})
     await persist_to_store(context, conversation_id, state)
 
     # 输出操作按钮

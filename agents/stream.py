@@ -349,6 +349,17 @@ async def handler(context):
                     yield context.utils.sse({"type": "done", "status": "error"})
                     return
 
+                # Safety: if user_message looks like a continuation action but we have no pending,
+                # it means the session was lost. Don't silently restart — tell the user.
+                if user_message.startswith("ACTION:"):
+                    log(f"[ERROR] Session lost: got ACTION message but no pending state. cid={cid}")
+                    yield context.utils.sse({
+                        "type": "error",
+                        "message": "会话状态丢失，请新建会话重试。" if locale == "zh" else "Session expired. Please start a new conversation.",
+                    })
+                    yield context.utils.sse({"type": "done", "status": "error"})
+                    return
+
                 flow = MarketingCampaignFlow(persistence=persistence)
                 # Set campaign_brief from first message
                 streaming = await flow.kickoff_async(inputs={

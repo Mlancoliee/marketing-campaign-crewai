@@ -133,8 +133,8 @@ export default function FinalizeView({
         <div className="flex gap-6">
           {/* 左侧：文档内容 */}
           <div className="flex-1 min-w-0">
-            <div className="card">
-              <div className="card-content text-sm">
+            <div className="card overflow-hidden">
+              <div className="card-content text-sm overflow-x-auto">
                 {finalDocument ? (
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm, remarkBreaks]}

@@ -10,20 +10,33 @@ interview_task:
     Current round: {discovery_rounds} of max 4.
 
     Your job:
+    - If this is round 4 (the final round), you MUST output [READY] followed by
+      a structured summary. Do NOT ask another question on round 4.
     - If you have enough information about: target audience, core selling points,
       budget range, and timeline — output exactly [READY] followed by a summary
       of audience profile and market insights.
-    - Otherwise, ask ONE focused question. Keep it concise (1-2 sentences).
+    - Otherwise (rounds 1-3 only), ask ONE focused question. Keep it concise (1-2 sentences).
       Do NOT ask multiple questions at once.
       After your question, add a line "[SUGGESTIONS]" followed by 2-3 example
       answers the user might give, each on its own line prefixed with "- ".
       These should be realistic, diverse options relevant to your question.
+
+    The [READY] summary MUST be structured as:
+    ## 目标受众画像
+    (demographics, psychographics, behaviors)
+
+    ## 市场洞察
+    (competitive landscape, opportunities, key insights)
+
+    If information is incomplete, infer reasonable defaults from the campaign brief
+    and Q&A history. Always produce a useful summary.
 
     Language: Respond in {locale_instruction}.
   expected_output: >
     Either:
     A) A single focused question (1-2 sentences) followed by [SUGGESTIONS] and
        2-3 example answers (each prefixed with "- "), OR
-    B) [READY] followed by a structured summary containing audience profile
-       and market insights.
+    B) [READY] followed by a structured summary with "## 目标受众画像" and
+       "## 市场洞察" sections.
+    On round 4, ALWAYS output option B.
   agent: market_analyst

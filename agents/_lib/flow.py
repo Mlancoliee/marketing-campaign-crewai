@@ -70,7 +70,8 @@ class CampaignState(BaseModel):
     finished: bool = False
 
     # 内部标志
-    _ready: bool = False
+    discovery_ready: bool = False  # [READY] detected — enough info for planning
+    invalidated_phases: list = []  # phases that need regeneration due to upstream redo
 
 
 class MarketingCampaignFlow(Flow[CampaignState]):
@@ -103,8 +104,16 @@ class MarketingCampaignFlow(Flow[CampaignState]):
 
         # 检测是否信息充足
         if "[READY]" in text:
-            s._ready = True
-            content = text.split("[READY]", 1)[1].strip()
+            s.discovery_ready = True
+            # [READY] can appear before or after the content — take the non-empty part
+            parts = text.split("[READY]", 1)
+            before = parts[0].strip()
+            after = parts[1].strip() if len(parts) > 1 else ""
+            # Use whichever side has the actual content
+            content = after if len(after) > len(before) else before
+            # Strip any [SUGGESTIONS] section from content
+            if "[SUGGESTIONS]" in content:
+                content = content.split("[SUGGESTIONS]")[0].strip()
             s.audience_profile = content
             s.market_insights = content
         else:
@@ -120,7 +129,11 @@ class MarketingCampaignFlow(Flow[CampaignState]):
         feedback = ""
         if self.last_human_feedback:
             feedback = (self.last_human_feedback.feedback or "").lower()
-        if self.state._ready or self.state.discovery_rounds >= MAX_DISCOVERY_ROUNDS:
+        if self.state.discovery_ready or self.state.discovery_rounds >= MAX_DISCOVERY_ROUNDS:
+            # Ensure audience_profile is set (fallback to qa_history if [READY] didn't fire)
+            if not self.state.audience_profile:
+                self.state.audience_profile = self.state.qa_history
+                self.state.market_insights = self.state.qa_history
             return "planning"
         if any(k in feedback for k in ("skip", "confirm", "action:confirm", "够了", "开始策划", "next")):
             # User wants to skip — use whatever info we have
@@ -190,6 +203,8 @@ class MarketingCampaignFlow(Flow[CampaignState]):
         })
         s.brand_creatives = _crew_text(result)
         s.current_phase = "planning"
+        # Mark downstream phases as needing regeneration
+        s.invalidated_phases = list(set(s.invalidated_phases + ["integration", "content", "finalize"]))
         return s.brand_creatives
 
     @router(redo_brand_step)
@@ -224,6 +239,8 @@ class MarketingCampaignFlow(Flow[CampaignState]):
         })
         s.channel_plan = _crew_text(result)
         s.current_phase = "planning"
+        # Mark downstream phases as needing regeneration
+        s.invalidated_phases = list(set(s.invalidated_phases + ["integration", "content", "finalize"]))
         return s.channel_plan
 
     @router(redo_channel_step)
@@ -255,6 +272,8 @@ class MarketingCampaignFlow(Flow[CampaignState]):
             "locale_instruction": locale_instruction,
         })
         s.integrated_strategy = _crew_text(result)
+        # Clear this phase from invalidated list (it was just regenerated)
+        s.invalidated_phases = [p for p in s.invalidated_phases if p != "integration"]
         return s.integrated_strategy
 
     @router(integration_step)
@@ -281,6 +300,8 @@ class MarketingCampaignFlow(Flow[CampaignState]):
             "locale_instruction": locale_instruction,
         })
         s.copywriting = _crew_text(result)
+        # Clear this phase from invalidated list (it was just regenerated)
+        s.invalidated_phases = [p for p in s.invalidated_phases if p != "content"]
         return s.copywriting
 
     @router(content_step)
@@ -315,24 +336,51 @@ class MarketingCampaignFlow(Flow[CampaignState]):
         s = self.state
         locale_instruction = "Chinese (中文)" if s.locale == "zh" else "English"
 
-        all_content = f"""Campaign: {s.campaign_name}
-=== AUDIENCE ===
+        # Build comprehensive input for full document generation
+        full_brief = f"""You are generating a COMPLETE marketing campaign plan document.
+Below is ALL the material produced by the team. Your job is to compile it into
+ONE structured, professional marketing plan document with the following chapters:
+
+1. Executive Summary (概述)
+2. Target Audience Analysis (目标受众分析)
+3. Brand & Creative Strategy (品牌创意策略)
+4. Channel & Media Plan (渠道媒体计划)
+5. Integrated Campaign Strategy (整合营销策略)
+6. Content & Copywriting (内容文案)
+7. Timeline & Milestones (排期与里程碑)
+8. Budget Allocation (预算分配)
+9. KPIs & Success Metrics (KPI与效果评估)
+
+Use the material below as source. Expand where needed, add timeline and budget
+estimates based on the channel plan, and ensure the document reads as a cohesive
+professional marketing plan that a team can execute from.
+
+─── SOURCE MATERIAL ───
+
+Campaign Name: {s.campaign_name}
+
+── Audience Profile ──
 {s.audience_profile}
-=== BRAND CREATIVE ===
+
+── Brand & Creative ──
 {s.brand_creatives}
-=== CHANNEL STRATEGY ===
+
+── Channel Strategy ──
 {s.channel_plan}
-=== INTEGRATED STRATEGY ===
+
+── Integrated Strategy ──
 {s.integrated_strategy}
-=== MARKETING COPY ===
-{s.copywriting}"""
+
+── Marketing Copy ──
+{s.copywriting}
+"""
 
         result = IntegrationCrew().crew().kickoff(inputs={
             "campaign_name": s.campaign_name,
-            "audience_profile": all_content,
+            "audience_profile": full_brief,
             "selected_creative": "",
             "channel_plan": "",
-            "locale_instruction": locale_instruction + "\n\nYOUR TASK: Generate a COMPLETE marketing campaign plan document with all chapters.",
+            "locale_instruction": locale_instruction,
         })
         s.integrated_strategy = _crew_text(result)
         return s.integrated_strategy

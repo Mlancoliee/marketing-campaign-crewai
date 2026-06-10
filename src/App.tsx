@@ -71,6 +71,8 @@ function reducer(state: AppState, action: AppAction): AppState {
       return {
         ...state,
         activeAgents: [...state.activeAgents, { agent: action.agent, lane: action.lane }],
+        // Clear finalDocument when chief_strategist starts in finalize (regenerating document)
+        ...(state.phase === "finalize" && action.agent === "chief_strategist" ? { finalDocument: "" } : {}),
       }
 
     case "CHUNK": {
@@ -341,7 +343,6 @@ export default function App() {
               send({ phase_action: { type: "confirm" }, locale: state.locale })
             }}
             onEditDocument={(fb) => {
-              dispatch({ type: "CLEAR_FINAL_DOC" })
               send({ iteration_feedback: fb, locale: state.locale })
             }}
             onGoBackToContent={() => send({ phase_action: { type: "rollback" }, locale: state.locale })}

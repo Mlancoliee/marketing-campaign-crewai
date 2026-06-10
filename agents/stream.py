@@ -132,6 +132,16 @@ async def handler(context):
             async def _keep_old_gen2():
                 yield context.utils.sse({"type": "done", "status": "completed"})
             return context.utils.stream_sse(_keep_old_gen2())
+        elif pa_type == "rollback":
+            # Generic "rollback" from frontend → map to phase-specific action
+            # Determine target phase from current pending state
+            rollback_target = _resolve_rollback_target(conversation_id)
+            if rollback_target:
+                user_message = f"ACTION:{rollback_target}"
+            else:
+                # Pending not in memory yet — mark as deferred rollback
+                # Will be resolved after load_pending_from_store
+                user_message = "ACTION:__rollback_deferred__"
         elif pa_type in BRANCH_ACTIONS:
             user_message = f"ACTION:{pa_type}" + (f"|feedback={pa_feedback}" if pa_feedback else "")
         elif pa_type and not user_message:
@@ -179,6 +189,11 @@ async def handler(context):
         is_resume = await load_pending_from_store(cid, store)
     log(f"turn={'resume' if is_resume else 'kickoff'} cid={cid}")
 
+    # Resolve deferred rollback now that pending is loaded
+    if user_message == "ACTION:__rollback_deferred__":
+        rollback_target = _resolve_rollback_target(cid)
+        user_message = f"ACTION:{rollback_target}" if rollback_target else "ACTION:rollback_to_planning"
+
     # ── SSE generator ──
     async def gen():
         pending_writes: list[asyncio.Task] = []
@@ -197,9 +212,14 @@ async def handler(context):
         try:
             yield context.utils.sse({"type": "flow_start"})
 
+            # Emit conversation_id so frontend can track it in localStorage history
+            yield context.utils.sse({"type": "conversation_id", "data": {"id": cid}})
+
             # Save user message
             if user_message:
                 fire_save("user", user_message)
+
+            flow = None  # Initialize for error handler access
 
             # ── Branch action: bypass Flow ──
             if is_resume and _is_branch_action(user_message):
@@ -210,8 +230,29 @@ async def handler(context):
                 await sync_pending_to_store(cid, store)
                 if pending_writes:
                     await asyncio.gather(*pending_writes, return_exceptions=True)
+                # Save metadata for history (after messages are written, conversation exists)
+                branch_pending = persistence.load_pending_feedback(cid)
+                if branch_pending:
+                    branch_state = CampaignState(**branch_pending[0])
+                    await _save_conversation_metadata(cid, store, branch_state)
                 yield context.utils.sse({"type": "done", "status": "completed"})
                 return
+
+            # ── Skip regeneration: confirm when next phase already has content ──
+            if is_resume and user_message in ("ACTION:confirm", "ACTION:confirm"):
+                can_skip = _can_skip_regeneration(cid, persistence)
+                if can_skip:
+                    async for event in _handle_advance_phase(cid, persistence, locale):
+                        yield context.utils.sse(event)
+                    await sync_pending_to_store(cid, store)
+                    if pending_writes:
+                        await asyncio.gather(*pending_writes, return_exceptions=True)
+                    adv_pending = persistence.load_pending_feedback(cid)
+                    if adv_pending:
+                        adv_state = CampaignState(**adv_pending[0])
+                        await _save_conversation_metadata(cid, store, adv_state)
+                    yield context.utils.sse({"type": "done", "status": "completed"})
+                    return
 
             # ── Main Flow: kickoff or resume ──
             if is_resume:
@@ -220,7 +261,8 @@ async def handler(context):
                 flow = MarketingCampaignFlow.from_pending(cid, persistence=persistence)
 
                 # Inject user answer into qa_history if still in discovery
-                if flow.state.current_phase == "discovery" and user_message:
+                # (but skip ACTION: messages — they're control commands, not user answers)
+                if flow.state.current_phase == "discovery" and user_message and not user_message.startswith("ACTION:"):
                     flow.state.qa_history = (
                         flow.state.qa_history + f"\nUser: {user_message}"
                     ).strip()
@@ -292,8 +334,12 @@ async def handler(context):
 
                     if agent_role == "chief_strategist" and phase_before not in ("discovery", "finalize"):
                         yield context.utils.sse({"type": "phase_change", "phase": "integration", "progress": _phase_progress("integration")})
+                        # Clear old strategy card to avoid appending to stale content
+                        yield context.utils.sse({"type": "card_update", "card": "strategy", "data": {"raw": "", "content": ""}})
                     elif agent_role == "copywriter":
                         yield context.utils.sse({"type": "phase_change", "phase": "content", "progress": _phase_progress("content")})
+                        # Clear old copywriting card
+                        yield context.utils.sse({"type": "card_update", "card": "copywriting", "data": {"raw": ""}})
 
                     yield context.utils.sse({"type": "agent_start", "agent": agent_role, **({"lane": lane} if lane else {})})
                     prev_agent = agent_role
@@ -342,6 +388,66 @@ async def handler(context):
                         "phase": "discovery",
                     })
 
+            # ── Auto-advance: if discovery_ready, immediately resume to enter planning ──
+            # This avoids requiring the user to send an extra message after [READY]
+            if flow.state.discovery_ready and flow.state.current_phase == "discovery":
+                log("Auto-advancing from discovery to planning (discovery_ready=True)")
+                streaming2 = await _stream_resume(flow, "ACTION:confirm")
+
+                # Reset streaming state for the planning phase
+                phase_before = flow.state.current_phase
+                prev_agent = ""
+                current_content = ""
+                agent_contents = []
+                in_parallel = False
+                planning_emitted = False
+
+                async for chunk in streaming2:
+                    raw_agent = (chunk.agent_role or "").strip()
+                    agent_role = _normalize_agent(raw_agent)
+
+                    if agent_role and agent_role != prev_agent:
+                        if prev_agent and current_content:
+                            fire_save("assistant", current_content, {"agent": prev_agent})
+                            agent_contents.append((prev_agent, current_content))
+                            current_content = ""
+                        if prev_agent:
+                            lane = _agent_to_lane(prev_agent)
+                            yield context.utils.sse({"type": "agent_end", "agent": prev_agent, **({"lane": lane} if lane else {})})
+
+                        lane = _agent_to_lane(agent_role)
+                        if lane in ("brand", "channel") and not planning_emitted:
+                            planning_emitted = True
+                            yield context.utils.sse({"type": "phase_change", "phase": "planning", "progress": _phase_progress("planning")})
+                            yield context.utils.sse({"type": "parallel_start", "lanes": ["brand", "channel"]})
+                            in_parallel = True
+                        if lane == "channel" and _agent_to_lane(prev_agent) == "brand":
+                            yield context.utils.sse({"type": "card_update", "card": "brand_creative", "data": {"raw": agent_contents[-1][1] if agent_contents else ""}})
+                        if not lane and in_parallel:
+                            in_parallel = False
+                            yield context.utils.sse({"type": "parallel_end"})
+
+                        yield context.utils.sse({"type": "agent_start", "agent": agent_role, **({"lane": lane} if lane else {})})
+                        prev_agent = agent_role
+
+                    if chunk.chunk_type == StreamChunkType.TEXT:
+                        text = chunk.content or ""
+                        current_content += text
+                        yield context.utils.sse({"type": "chunk", "agent": agent_role or prev_agent, "content": text})
+
+                # Final agent content from auto-advance
+                if prev_agent and current_content:
+                    fire_save("assistant", current_content, {"agent": prev_agent})
+                    agent_contents.append((prev_agent, current_content))
+                if prev_agent:
+                    lane = _agent_to_lane(prev_agent)
+                    yield context.utils.sse({"type": "agent_end", "agent": prev_agent, **({"lane": lane} if lane else {})})
+                if in_parallel:
+                    yield context.utils.sse({"type": "parallel_end"})
+
+                # Update phase after auto-advance
+                phase = flow.state.current_phase
+
             # If phase changed during streaming (e.g., discovery → planning), emit final phase
             if phase != phase_before:
                 yield context.utils.sse({"type": "phase_change", "phase": phase, "progress": _phase_progress(phase)})
@@ -372,11 +478,40 @@ async def handler(context):
             await sync_pending_to_store(cid, store)
             if pending_writes:
                 await asyncio.gather(*pending_writes, return_exceptions=True)
+            # Save conversation metadata for history restoration (after messages are written)
+            await _save_conversation_metadata(cid, store, flow.state)
             yield context.utils.sse({"type": "done", "status": "completed"})
 
         except Exception as e:
             log(f"stream error: {e}")
             yield context.utils.sse({"type": "error", "message": str(e)})
+            # If Flow cleared pending during resume but failed before saving new pending,
+            # restore the state so the user can retry (not lose entire session)
+            if is_resume and not has_pending(cid):
+                log(f"Restoring pending state after error for cid={cid}")
+                from crewai.flow.async_feedback.types import PendingFeedbackContext
+                try:
+                    phase = flow.state.current_phase if flow else phase_before
+                    phase_to_method = {
+                        "discovery": "discovery_step",
+                        "planning": "planning_step",
+                        "integration": "integration_step",
+                        "content": "content_step",
+                        "finalize": "finalize_step",
+                    }
+                    method_name = phase_to_method.get(phase, "planning_step")
+                    state_data = flow.state.model_dump() if flow else {}
+                    if state_data:
+                        ctx = PendingFeedbackContext(
+                            flow_id=cid,
+                            flow_class="agents._lib.flow.MarketingCampaignFlow",
+                            method_name=method_name,
+                            method_output="",
+                            message="(user reviews)",
+                        )
+                        persistence.save_pending_feedback(cid, ctx, state_data)
+                except Exception as restore_err:
+                    log(f"Failed to restore pending: {restore_err}")
             await sync_pending_to_store(cid, store)
             if pending_writes:
                 await asyncio.gather(*pending_writes, return_exceptions=True)
@@ -415,6 +550,8 @@ async def _handle_branch_action(message, cid, persistence, locale, context):
         state.brand_creatives = _crew_text(result)
         yield {"type": "agent_end", "agent": "Brand & Creative Director"}
         yield {"type": "card_update", "card": "brand_creative", "data": {"raw": state.brand_creatives}}
+        # Mark downstream phases as needing regeneration
+        state.invalidated_phases = list(set(getattr(state, 'invalidated_phases', []) + ["integration", "content", "finalize"]))
 
     elif action == "redo_channel":
         yield {"type": "phase_change", "phase": "planning"}
@@ -423,6 +560,8 @@ async def _handle_branch_action(message, cid, persistence, locale, context):
         state.channel_plan = _crew_text(result)
         yield {"type": "agent_end", "agent": "Channel & Media Planner"}
         yield {"type": "card_update", "card": "channel_plan", "data": {"raw": state.channel_plan}}
+        # Mark downstream phases as needing regeneration
+        state.invalidated_phases = list(set(getattr(state, 'invalidated_phases', []) + ["integration", "content", "finalize"]))
 
     elif action == "rollback_to_planning":
         state.current_phase = "planning"
@@ -440,10 +579,22 @@ async def _handle_branch_action(message, cid, persistence, locale, context):
         yield {"type": "phase_change", "phase": "content"}
         yield {"type": "card_update", "card": "copywriting", "data": {"raw": state.copywriting}}
 
-    # Save updated state back to persistence (keeps Flow pending context intact)
+    # Save updated state back to persistence with correct method_name
+    # so Flow resumes from the right step on next interaction
     from crewai.flow.async_feedback.types import PendingFeedbackContext
-    pending_ctx = pending[1] if pending else PendingFeedbackContext(
-        method_name="planning_step", message="(user reviews)"
+    phase_to_method = {
+        "planning": "planning_step",
+        "integration": "integration_step",
+        "content": "content_step",
+        "finalize": "finalize_step",
+    }
+    method_name = phase_to_method.get(state.current_phase, "planning_step")
+    pending_ctx = PendingFeedbackContext(
+        flow_id=cid,
+        flow_class="agents._lib.flow.MarketingCampaignFlow",
+        method_name=method_name,
+        method_output="",
+        message="(user reviews)",
     )
     persistence.save_pending_feedback(cid, pending_ctx, state.model_dump())
 
@@ -459,28 +610,60 @@ async def _handle_history(context, body):
         return {"conversation_id": "", "chat_history": [], "current_phase": "start"}
 
     try:
-        messages = await context.store.get_messages(
+        store = context.store
+        messages = await store.get_messages(
             conversation_id=conversation_id, limit=100, order="asc"
         )
         chat_history = []
         for m in messages:
             meta_data = m.metadata or {}
+            if meta_data.get("type") == "init":
+                continue
             agent = meta_data.get("agent", m.role)
             chat_history.append({"role": agent, "content": m.content})
 
-        # Try to determine phase from persistence
+        # Try to determine phase and cards from persistence
         persistence = get_persistence()
+        current_phase = "discovery" if chat_history else "start"
+        cards = {}
+
+        # First try in-memory pending
         pending = persistence.load_pending_feedback(conversation_id)
+        if not pending:
+            # Try to load from store
+            await load_pending_from_store(conversation_id, store)
+            pending = persistence.load_pending_feedback(conversation_id)
+
         if pending:
             state_data = pending[0]
-            current_phase = state_data.get("current_phase", "discovery")
-        else:
-            current_phase = "discovery" if chat_history else "start"
+            current_phase = state_data.get("current_phase", current_phase)
+            # Build cards from state
+            if state_data.get("brand_creatives"):
+                cards["brand_creative"] = {"raw": state_data["brand_creatives"]}
+            if state_data.get("channel_plan"):
+                cards["channel_plan"] = {"raw": state_data["channel_plan"]}
+            if state_data.get("integrated_strategy"):
+                cards["strategy"] = {"raw": state_data["integrated_strategy"], "content": state_data["integrated_strategy"]}
+            if state_data.get("copywriting"):
+                cards["copywriting"] = {"raw": state_data["copywriting"]}
+            if state_data.get("audience_profile"):
+                cards["audience"] = {"content": state_data["audience_profile"]}
+
+        # Fallback: try conversation metadata
+        if not cards:
+            try:
+                meta = await store.get_conversation(conversation_id=conversation_id)
+                if meta and meta.metadata:
+                    current_phase = meta.metadata.get("current_phase", current_phase)
+                    cards = meta.metadata.get("cards", {})
+            except Exception:
+                pass
 
         return {
             "conversation_id": conversation_id,
             "chat_history": chat_history,
             "current_phase": current_phase,
+            "cards": cards,
         }
     except Exception:
         return {"conversation_id": conversation_id, "chat_history": [], "current_phase": "start"}
@@ -562,6 +745,152 @@ def _agent_to_lane(agent_role: str) -> str:
     if agent_id == "channel_planner":
         return "channel"
     return ""
+
+
+def _resolve_rollback_target(cid: str) -> str:
+    """Map generic 'rollback' to the correct phase-specific action based on current state."""
+    persistence = get_persistence()
+    pending = persistence.load_pending_feedback(cid)
+    if not pending:
+        return ""
+    state_data = pending[0]
+    current_phase = state_data.get("current_phase", "")
+    # Map: current phase → which phase to roll back to
+    mapping = {
+        "integration": "rollback_to_planning",
+        "content": "rollback_to_integration",
+        "finalize": "rollback_to_content",
+    }
+    return mapping.get(current_phase, "")
+
+
+def _can_skip_regeneration(cid: str, persistence) -> bool:
+    """Check if we can skip regeneration on confirm (next phase has valid content)."""
+    pending = persistence.load_pending_feedback(cid)
+    if not pending:
+        return False
+    state_data = pending[0]
+    current_phase = state_data.get("current_phase", "")
+    invalidated = state_data.get("invalidated_phases", [])
+
+    # Determine next phase
+    next_phase_map = {
+        "planning": "integration",
+        "integration": "content",
+        "content": "finalize",
+    }
+    next_phase = next_phase_map.get(current_phase, "")
+    if not next_phase:
+        return False
+
+    # Check if next phase is invalidated
+    if next_phase in invalidated:
+        return False
+
+    # Check if next phase already has content
+    content_check = {
+        "integration": bool(state_data.get("integrated_strategy")),
+        "content": bool(state_data.get("copywriting")),
+        "finalize": bool(state_data.get("copywriting")),  # finalize just needs content to exist
+    }
+    return content_check.get(next_phase, False)
+
+
+async def _handle_advance_phase(cid, persistence, locale):
+    """Advance to next phase without regeneration — emit existing content."""
+    from crewai.flow.async_feedback.types import PendingFeedbackContext
+
+    pending = persistence.load_pending_feedback(cid)
+    if not pending:
+        yield {"type": "error", "message": "No pending state found"}
+        return
+    state_data, _ = pending
+    state = CampaignState(**state_data)
+
+    current_phase = state.current_phase
+    next_phase_map = {
+        "planning": "integration",
+        "integration": "content",
+        "content": "finalize",
+    }
+    next_phase = next_phase_map.get(current_phase, "finalize")
+
+    # Advance state
+    state.current_phase = next_phase
+    # Remove this phase from invalidated list (if it was there)
+    invalidated = getattr(state, 'invalidated_phases', [])
+    state.invalidated_phases = [p for p in invalidated if p != next_phase]
+
+    yield {"type": "phase_change", "phase": next_phase, "progress": _phase_progress(next_phase)}
+
+    # Emit existing card data for the phase
+    if next_phase == "integration" and state.integrated_strategy:
+        yield {"type": "card_update", "card": "strategy", "data": {"raw": state.integrated_strategy, "content": state.integrated_strategy}}
+    elif next_phase == "content" and state.copywriting:
+        yield {"type": "card_update", "card": "copywriting", "data": {"raw": state.copywriting}}
+    elif next_phase == "finalize":
+        pass  # Finalize phase doesn't auto-generate
+
+    # Save updated state
+    phase_to_method = {
+        "planning": "planning_step",
+        "integration": "integration_step",
+        "content": "content_step",
+        "finalize": "finalize_step",
+    }
+    method_name = phase_to_method.get(next_phase, "finalize_step")
+    pending_ctx = PendingFeedbackContext(
+        flow_id=cid,
+        flow_class="agents._lib.flow.MarketingCampaignFlow",
+        method_name=method_name,
+        method_output="",
+        message="(user reviews)",
+    )
+    persistence.save_pending_feedback(cid, pending_ctx, state.model_dump())
+    yield {"type": "actions", "actions": _get_actions(next_phase, state, locale)}
+
+
+async def _save_conversation_metadata(cid: str, store, state) -> None:
+    """Save current_phase and cards to conversation metadata for /history endpoint."""
+    cards = {}
+    if state.brand_creatives:
+        cards["brand_creative"] = {"raw": state.brand_creatives}
+    if state.channel_plan:
+        cards["channel_plan"] = {"raw": state.channel_plan}
+    if state.integrated_strategy:
+        cards["strategy"] = {"raw": state.integrated_strategy, "content": state.integrated_strategy}
+    if state.copywriting:
+        cards["copywriting"] = {"raw": state.copywriting}
+    if state.audience_profile:
+        cards["audience"] = {"content": state.audience_profile}
+
+    log(f"[META] saving metadata for cid={cid} phase={state.current_phase} cards_keys={list(cards.keys())}")
+
+    try:
+        # Ensure conversation exists before updating metadata
+        try:
+            await store.get_conversation(conversation_id=cid)
+            log(f"[META] conversation exists: {cid}")
+        except Exception as e:
+            log(f"[META] conversation not found ({e}), creating init message")
+            # Conversation doesn't exist yet — create it with an init message
+            await store.append_message(
+                conversation_id=cid,
+                role="system",
+                content=f"Campaign: {getattr(state, 'campaign_name', '')}",
+                metadata={"type": "init"},
+            )
+        await store.update_conversation(
+            conversation_id=cid,
+            metadata={
+                "current_phase": state.current_phase,
+                "cards": cards,
+                "campaign_name": getattr(state, "campaign_name", ""),
+            },
+        )
+        log(f"[META] metadata saved successfully for cid={cid}")
+    except Exception as e:
+        log(f"[META] save conversation metadata FAILED: {e}")
 
 
 def _normalize_agent(agent_role: str) -> str:

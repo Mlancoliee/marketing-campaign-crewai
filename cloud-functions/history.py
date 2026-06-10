@@ -31,6 +31,9 @@ class handler(BaseHTTPRequestHandler):
                     meta_data = m.metadata or {}
                     if meta_data.get("type") == "init":
                         continue
+                    # Skip ACTION: messages (internal control commands)
+                    if m.content and m.content.startswith("ACTION:"):
+                        continue
                     role = meta_data.get("agent", m.role)
                     chat_history.append({
                         "role": role,

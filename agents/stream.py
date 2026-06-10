@@ -71,18 +71,15 @@ async def _stream_resume(flow, feedback: str) -> FlowStreamingOutput:
 
 # ─── Streaming loop (reusable async generator) ──────────────────────
 
-async def _consume_stream(streaming, context, fire_save, phase_before: str):
+async def _consume_stream(streaming, context, phase_before: str):
     """Consume a FlowStreamingOutput and yield SSE events.
 
     Handles agent detection, phase transitions, parallel lanes, and card clearing.
     Yields: SSE event dicts (already wrapped via context.utils.sse).
     After exhausting, caller should read `result` attributes from the returned state.
 
-    Usage:
-        state = StreamState()
-        async for event in _consume_stream(streaming, ctx, fire_save, phase_before, state):
-            yield event
-        # state.agent_contents, state.in_parallel available after loop
+    Note: Generated content is NOT saved as messages — it's persisted via Flow state
+    and exposed to the frontend through card_update events. Only user messages are stored.
     """
     prev_agent = ""
     current_content = ""
@@ -97,7 +94,6 @@ async def _consume_stream(streaming, context, fire_save, phase_before: str):
         # Detect agent switch
         if agent_role and agent_role != prev_agent:
             if prev_agent and current_content:
-                fire_save("assistant", current_content, {"agent": prev_agent})
                 agent_contents.append((prev_agent, current_content))
                 current_content = ""
             if prev_agent:
@@ -137,7 +133,6 @@ async def _consume_stream(streaming, context, fire_save, phase_before: str):
 
     # Final agent content
     if prev_agent and current_content:
-        fire_save("assistant", current_content, {"agent": prev_agent})
         agent_contents.append((prev_agent, current_content))
     if prev_agent:
         lane = _agent_to_lane(prev_agent)
@@ -376,7 +371,7 @@ async def handler(context):
 
             # ── Consume streaming output ──
             agent_contents: list[tuple[str, str]] = []
-            async for event in _consume_stream(streaming, context, fire_save, phase_before):
+            async for event in _consume_stream(streaming, context, phase_before):
                 if isinstance(event, dict) and event.get("__stream_result__"):
                     agent_contents = event["agent_contents"]
                 else:
@@ -413,7 +408,7 @@ async def handler(context):
                 streaming2 = await _stream_resume(flow, "ACTION:confirm")
                 phase_before = flow.state.current_phase
 
-                async for event in _consume_stream(streaming2, context, fire_save, phase_before):
+                async for event in _consume_stream(streaming2, context, phase_before):
                     if isinstance(event, dict) and event.get("__stream_result__"):
                         agent_contents = event["agent_contents"]
                     else:
@@ -447,6 +442,28 @@ async def handler(context):
 
             # Emit actions
             yield context.utils.sse({"type": "actions", "actions": _get_actions(phase, flow.state, locale)})
+
+            # ── Safety: if pending was lost (cleared by resume but step failed silently),
+            # restore it so the session isn't lost on next request ──
+            if is_resume and flow and not has_pending(cid):
+                log(f"[SAFETY] Pending lost after streaming — restoring for cid={cid} phase={flow.state.current_phase}")
+                from crewai.flow.async_feedback.types import PendingFeedbackContext
+                phase_to_method = {
+                    "discovery": "discovery_step",
+                    "planning": "planning_step",
+                    "integration": "integration_step",
+                    "content": "content_step",
+                    "finalize": "finalize_step",
+                }
+                method_name = phase_to_method.get(flow.state.current_phase, "planning_step")
+                ctx = PendingFeedbackContext(
+                    flow_id=cid,
+                    flow_class="agents._lib.flow.MarketingCampaignFlow",
+                    method_name=method_name,
+                    method_output="",
+                    message="(user reviews)",
+                )
+                persistence.save_pending_feedback(cid, ctx, flow.state.model_dump())
 
             # Sync to store
             await sync_pending_to_store(cid, store)
@@ -592,6 +609,9 @@ async def _handle_history(context, body):
         for m in messages:
             meta_data = m.metadata or {}
             if meta_data.get("type") == "init":
+                continue
+            # Skip ACTION: messages (internal control commands, not user-facing)
+            if m.content and m.content.startswith("ACTION:"):
                 continue
             agent = meta_data.get("agent", m.role)
             chat_history.append({"role": agent, "content": m.content})

@@ -343,6 +343,7 @@ export default function App() {
               send({ phase_action: { type: "confirm" }, locale: state.locale })
             }}
             onEditDocument={(fb) => {
+              dispatch({ type: "CLEAR_FINAL_DOC" })
               send({ iteration_feedback: fb, locale: state.locale })
             }}
             onGoBackToContent={() => send({ phase_action: { type: "rollback" }, locale: state.locale })}

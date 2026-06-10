@@ -23,7 +23,6 @@ from crewai.flow import Flow, listen, or_, router, start
 from crewai.flow.human_feedback import human_feedback
 
 from .feedback_provider import PROVIDER
-from .llm import get_collapse_llm
 from .logger import make_logger
 from .._crews.discovery_crew.discovery_crew import DiscoveryCrew
 from .._crews.brand_creative_crew.brand_creative_crew import BrandCreativeCrew
@@ -437,17 +436,6 @@ Campaign Name: {s.campaign_name}
 
 
 # ─── Helpers ─────────────────────────────────────────────────────
-
-def bind_collapse_llm():
-    """Patch the real LLM into @human_feedback methods after init_llm()."""
-    llm = get_collapse_llm()
-    for name in ("discovery_step", "planning_step", "redo_brand_step", "redo_channel_step",
-                 "integration_step", "content_step", "finalize_step",
-                 "generate_document_step", "revise_document_step"):
-        method = getattr(MarketingCampaignFlow, name, None)
-        if method:
-            setattr(method, "_hf_llm", llm)
-
 
 def _crew_text(output) -> str:
     """Extract text from CrewOutput."""

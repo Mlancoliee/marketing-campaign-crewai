@@ -80,12 +80,19 @@ export default function FinalizeView({
 }: FinalizeViewProps) {
   const [expanded, setExpanded] = useState<CardType | null>(null)
   const [feedback, setFeedback] = useState("")
+  const [waitingForDocument, setWaitingForDocument] = useState(false)
   const items = getItems(cards)
   const isGenerating = activeAgents.some((a) => a.agent === "chief_strategist")
   const zh = t("action.confirm") === "确认"
 
+  // Clear waitingForDocument once content starts arriving or streaming ends
+  if (waitingForDocument && (finalDocument || (!streaming && !isGenerating))) {
+    setWaitingForDocument(false)
+  }
+
   const handleEditSubmit = useCallback(() => {
     if (!feedback.trim()) return
+    setWaitingForDocument(true)
     onEditDocument(feedback.trim())
     setFeedback("")
   }, [feedback, onEditDocument])
@@ -93,7 +100,7 @@ export default function FinalizeView({
   // ═══════════════════════════════════════════════════════════
   // 方案调整阶段：完整方案文档 + 右侧目录 + 修改输入
   // ═══════════════════════════════════════════════════════════
-  if (finalDocument) {
+  if (finalDocument || isGenerating || waitingForDocument) {
     const headings = extractHeadings(finalDocument)
 
     return (
@@ -128,25 +135,38 @@ export default function FinalizeView({
           <div className="flex-1 min-w-0">
             <div className="card">
               <div className="card-content text-sm">
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm, remarkBreaks]}
-                  components={{
-                    h1: ({ children }) => {
-                      const id = String(children).toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-").replace(/^-|-$/g, "")
-                      return <h1 id={id}>{children}</h1>
-                    },
-                    h2: ({ children }) => {
-                      const id = String(children).toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-").replace(/^-|-$/g, "")
-                      return <h2 id={id}>{children}</h2>
-                    },
-                    h3: ({ children }) => {
-                      const id = String(children).toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-").replace(/^-|-$/g, "")
-                      return <h3 id={id}>{children}</h3>
-                    },
-                  }}
-                >
-                  {finalDocument}
-                </ReactMarkdown>
+                {finalDocument ? (
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm, remarkBreaks]}
+                    components={{
+                      h1: ({ children }) => {
+                        const id = String(children).toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-").replace(/^-|-$/g, "")
+                        return <h1 id={id}>{children}</h1>
+                      },
+                      h2: ({ children }) => {
+                        const id = String(children).toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-").replace(/^-|-$/g, "")
+                        return <h2 id={id}>{children}</h2>
+                      },
+                      h3: ({ children }) => {
+                        const id = String(children).toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-").replace(/^-|-$/g, "")
+                        return <h3 id={id}>{children}</h3>
+                      },
+                    }}
+                  >
+                    {finalDocument}
+                  </ReactMarkdown>
+                ) : (
+                  <div className="flex flex-col items-center justify-center py-16 gap-3 w-full">
+                    <div className="flex gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-[var(--color-primary)] animate-pulse-dot" />
+                      <span className="w-2 h-2 rounded-full bg-[var(--color-primary)] animate-pulse-dot" style={{ animationDelay: "0.2s" }} />
+                      <span className="w-2 h-2 rounded-full bg-[var(--color-primary)] animate-pulse-dot" style={{ animationDelay: "0.4s" }} />
+                    </div>
+                    <p className="text-sm text-[var(--color-text-muted)]">
+                      {zh ? "\u6b63\u5728\u751f\u6210\u65b9\u6848..." : "Generating plan..."}
+                    </p>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -176,9 +196,9 @@ export default function FinalizeView({
             </div>
           </div>
 
-          {/* 右侧：目录导航 */}
-          {headings.length > 0 && (
-            <nav className="hidden lg:block w-48 flex-shrink-0">
+          {/* 右侧：目录导航（始终占位保持宽度一致） */}
+          <nav className="hidden lg:block w-48 flex-shrink-0">
+            {headings.length > 0 && (
               <div className="sticky top-16">
                 <p className="text-xs font-semibold text-[var(--color-text-muted)] uppercase mb-2">
                   {zh ? "目录" : "Contents"}
@@ -200,8 +220,8 @@ export default function FinalizeView({
                   ))}
                 </ul>
               </div>
-            </nav>
-          )}
+            )}
+          </nav>
         </div>
       </div>
     )
@@ -235,7 +255,7 @@ export default function FinalizeView({
             {zh ? "导出" : "Export"}
           </button>
           <button
-            onClick={onGenerateDocument}
+            onClick={() => { setWaitingForDocument(true); onGenerateDocument() }}
             disabled={streaming}
             className="btn btn-cta cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
           >

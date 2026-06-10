@@ -19,7 +19,7 @@ from crewai.utilities.streaming import (
     signal_error,
 )
 
-from agents._lib.flow import MarketingCampaignFlow, CampaignState, bind_collapse_llm, _crew_text
+from agents._lib.flow import MarketingCampaignFlow, CampaignState, _crew_text
 from agents._lib.llm import init_llm
 from agents._lib.logger import make_logger
 from agents._lib.persistence import (
@@ -67,6 +67,86 @@ async def _stream_resume(flow, feedback: str) -> FlowStreamingOutput:
     register_cleanup(streaming, state)
     output_holder.append(streaming)
     return streaming
+
+
+# ─── Streaming loop (reusable async generator) ──────────────────────
+
+async def _consume_stream(streaming, context, fire_save, phase_before: str):
+    """Consume a FlowStreamingOutput and yield SSE events.
+
+    Handles agent detection, phase transitions, parallel lanes, and card clearing.
+    Yields: SSE event dicts (already wrapped via context.utils.sse).
+    After exhausting, caller should read `result` attributes from the returned state.
+
+    Usage:
+        state = StreamState()
+        async for event in _consume_stream(streaming, ctx, fire_save, phase_before, state):
+            yield event
+        # state.agent_contents, state.in_parallel available after loop
+    """
+    prev_agent = ""
+    current_content = ""
+    agent_contents: list[tuple[str, str]] = []
+    in_parallel = False
+    planning_emitted = False
+
+    async for chunk in streaming:
+        raw_agent = (chunk.agent_role or "").strip()
+        agent_role = _normalize_agent(raw_agent)
+
+        # Detect agent switch
+        if agent_role and agent_role != prev_agent:
+            if prev_agent and current_content:
+                fire_save("assistant", current_content, {"agent": prev_agent})
+                agent_contents.append((prev_agent, current_content))
+                current_content = ""
+            if prev_agent:
+                lane = _agent_to_lane(prev_agent)
+                yield context.utils.sse({"type": "agent_end", "agent": prev_agent, **({"lane": lane} if lane else {})})
+
+            # Detect phase transitions based on agent role
+            lane = _agent_to_lane(agent_role)
+
+            if lane in ("brand", "channel") and not planning_emitted:
+                planning_emitted = True
+                yield context.utils.sse({"type": "phase_change", "phase": "planning", "progress": _phase_progress("planning")})
+                yield context.utils.sse({"type": "parallel_start", "lanes": ["brand", "channel"]})
+                in_parallel = True
+
+            if lane == "channel" and _agent_to_lane(prev_agent) == "brand":
+                yield context.utils.sse({"type": "card_update", "card": "brand_creative", "data": {"raw": agent_contents[-1][1] if agent_contents else ""}})
+
+            if not lane and in_parallel:
+                in_parallel = False
+                yield context.utils.sse({"type": "parallel_end"})
+
+            if agent_role == "chief_strategist" and phase_before not in ("discovery", "finalize"):
+                yield context.utils.sse({"type": "phase_change", "phase": "integration", "progress": _phase_progress("integration")})
+                yield context.utils.sse({"type": "card_update", "card": "strategy", "data": {"raw": "", "content": ""}})
+            elif agent_role == "copywriter":
+                yield context.utils.sse({"type": "phase_change", "phase": "content", "progress": _phase_progress("content")})
+                yield context.utils.sse({"type": "card_update", "card": "copywriting", "data": {"raw": ""}})
+
+            yield context.utils.sse({"type": "agent_start", "agent": agent_role, **({"lane": lane} if lane else {})})
+            prev_agent = agent_role
+
+        if chunk.chunk_type == StreamChunkType.TEXT:
+            text = chunk.content or ""
+            current_content += text
+            yield context.utils.sse({"type": "chunk", "agent": agent_role or prev_agent, "content": text})
+
+    # Final agent content
+    if prev_agent and current_content:
+        fire_save("assistant", current_content, {"agent": prev_agent})
+        agent_contents.append((prev_agent, current_content))
+    if prev_agent:
+        lane = _agent_to_lane(prev_agent)
+        yield context.utils.sse({"type": "agent_end", "agent": prev_agent, **({"lane": lane} if lane else {})})
+    if in_parallel:
+        yield context.utils.sse({"type": "parallel_end"})
+
+    # Yield a sentinel with accumulated data (caller can detect by type)
+    yield {"__stream_result__": True, "agent_contents": agent_contents, "in_parallel": in_parallel}
 
 
 # ─── Branch action detection ─────────────────────────────────────────
@@ -174,7 +254,6 @@ async def handler(context):
     # Init LLM
     try:
         init_llm(context.env)
-        bind_collapse_llm()
     except Exception as e:
         log(f"LLM init error: {e}")
         return {"status_code": 500, "body": {"error": str(e)}}
@@ -287,11 +366,7 @@ async def handler(context):
             # ── Streaming loop ──
             # Record phase BEFORE streaming to detect transitions
             phase_before = flow.state.current_phase
-            prev_agent = ""
-            current_content = ""
-            agent_contents: list[tuple[str, str]] = []  # (agent_role, content)
-            in_parallel = False  # Track if we're in parallel planning mode
-            planning_emitted = False  # Track if we already sent phase_change for planning
+            agent_contents: list[tuple[str, str]] = []
 
             yield context.utils.sse({"type": "phase_change", "phase": phase_before, "progress": _phase_progress(phase_before)})
 
@@ -299,70 +374,13 @@ async def handler(context):
             if phase_before == "discovery":
                 yield context.utils.sse({"type": "agent_start", "agent": "market_analyst"})
 
-            async for chunk in streaming:
-                raw_agent = (chunk.agent_role or "").strip()
-                agent_role = _normalize_agent(raw_agent)  # Convert to frontend agent_id
-
-                # Detect agent switch
-                if agent_role and agent_role != prev_agent:
-                    if prev_agent and current_content:
-                        fire_save("assistant", current_content, {"agent": prev_agent})
-                        agent_contents.append((prev_agent, current_content))
-                        current_content = ""
-                    if prev_agent:
-                        lane = _agent_to_lane(prev_agent)
-                        yield context.utils.sse({"type": "agent_end", "agent": prev_agent, **({"lane": lane} if lane else {})})
-
-                    # Detect phase transitions based on agent role
-                    lane = _agent_to_lane(agent_role)
-
-                    if lane in ("brand", "channel") and not planning_emitted:
-                        # Entering planning phase — emit phase_change + parallel_start
-                        planning_emitted = True
-                        yield context.utils.sse({"type": "phase_change", "phase": "planning", "progress": _phase_progress("planning")})
-                        yield context.utils.sse({"type": "parallel_start", "lanes": ["brand", "channel"]})
-                        in_parallel = True
-
-                    if lane == "channel" and _agent_to_lane(prev_agent) == "brand":
-                        # Switching from brand to channel within parallel
-                        yield context.utils.sse({"type": "card_update", "card": "brand_creative", "data": {"raw": agent_contents[-1][1] if agent_contents else ""}})
-
-                    if not lane and in_parallel:
-                        # Exiting parallel mode
-                        in_parallel = False
-                        yield context.utils.sse({"type": "parallel_end"})
-
-                    if agent_role == "chief_strategist" and phase_before not in ("discovery", "finalize"):
-                        yield context.utils.sse({"type": "phase_change", "phase": "integration", "progress": _phase_progress("integration")})
-                        # Clear old strategy card to avoid appending to stale content
-                        yield context.utils.sse({"type": "card_update", "card": "strategy", "data": {"raw": "", "content": ""}})
-                    elif agent_role == "copywriter":
-                        yield context.utils.sse({"type": "phase_change", "phase": "content", "progress": _phase_progress("content")})
-                        # Clear old copywriting card
-                        yield context.utils.sse({"type": "card_update", "card": "copywriting", "data": {"raw": ""}})
-
-                    yield context.utils.sse({"type": "agent_start", "agent": agent_role, **({"lane": lane} if lane else {})})
-                    prev_agent = agent_role
-
-                if chunk.chunk_type == StreamChunkType.TEXT:
-                    text = chunk.content or ""
-                    current_content += text
-                    yield context.utils.sse({
-                        "type": "chunk",
-                        "agent": agent_role or prev_agent,
-                        "content": text,
-                    })
-
-            # Final agent content
-            if prev_agent and current_content:
-                fire_save("assistant", current_content, {"agent": prev_agent})
-                agent_contents.append((prev_agent, current_content))
-            if prev_agent:
-                lane = _agent_to_lane(prev_agent)
-                yield context.utils.sse({"type": "agent_end", "agent": prev_agent, **({"lane": lane} if lane else {})})
-
-            if in_parallel:
-                yield context.utils.sse({"type": "parallel_end"})
+            # ── Consume streaming output ──
+            agent_contents: list[tuple[str, str]] = []
+            async for event in _consume_stream(streaming, context, fire_save, phase_before):
+                if isinstance(event, dict) and event.get("__stream_result__"):
+                    agent_contents = event["agent_contents"]
+                else:
+                    yield event
 
             # ── Post-streaming: emit structured events ──
             phase = flow.state.current_phase
@@ -393,57 +411,13 @@ async def handler(context):
             if flow.state.discovery_ready and flow.state.current_phase == "discovery":
                 log("Auto-advancing from discovery to planning (discovery_ready=True)")
                 streaming2 = await _stream_resume(flow, "ACTION:confirm")
-
-                # Reset streaming state for the planning phase
                 phase_before = flow.state.current_phase
-                prev_agent = ""
-                current_content = ""
-                agent_contents = []
-                in_parallel = False
-                planning_emitted = False
 
-                async for chunk in streaming2:
-                    raw_agent = (chunk.agent_role or "").strip()
-                    agent_role = _normalize_agent(raw_agent)
-
-                    if agent_role and agent_role != prev_agent:
-                        if prev_agent and current_content:
-                            fire_save("assistant", current_content, {"agent": prev_agent})
-                            agent_contents.append((prev_agent, current_content))
-                            current_content = ""
-                        if prev_agent:
-                            lane = _agent_to_lane(prev_agent)
-                            yield context.utils.sse({"type": "agent_end", "agent": prev_agent, **({"lane": lane} if lane else {})})
-
-                        lane = _agent_to_lane(agent_role)
-                        if lane in ("brand", "channel") and not planning_emitted:
-                            planning_emitted = True
-                            yield context.utils.sse({"type": "phase_change", "phase": "planning", "progress": _phase_progress("planning")})
-                            yield context.utils.sse({"type": "parallel_start", "lanes": ["brand", "channel"]})
-                            in_parallel = True
-                        if lane == "channel" and _agent_to_lane(prev_agent) == "brand":
-                            yield context.utils.sse({"type": "card_update", "card": "brand_creative", "data": {"raw": agent_contents[-1][1] if agent_contents else ""}})
-                        if not lane and in_parallel:
-                            in_parallel = False
-                            yield context.utils.sse({"type": "parallel_end"})
-
-                        yield context.utils.sse({"type": "agent_start", "agent": agent_role, **({"lane": lane} if lane else {})})
-                        prev_agent = agent_role
-
-                    if chunk.chunk_type == StreamChunkType.TEXT:
-                        text = chunk.content or ""
-                        current_content += text
-                        yield context.utils.sse({"type": "chunk", "agent": agent_role or prev_agent, "content": text})
-
-                # Final agent content from auto-advance
-                if prev_agent and current_content:
-                    fire_save("assistant", current_content, {"agent": prev_agent})
-                    agent_contents.append((prev_agent, current_content))
-                if prev_agent:
-                    lane = _agent_to_lane(prev_agent)
-                    yield context.utils.sse({"type": "agent_end", "agent": prev_agent, **({"lane": lane} if lane else {})})
-                if in_parallel:
-                    yield context.utils.sse({"type": "parallel_end"})
+                async for event in _consume_stream(streaming2, context, fire_save, phase_before):
+                    if isinstance(event, dict) and event.get("__stream_result__"):
+                        agent_contents = event["agent_contents"]
+                    else:
+                        yield event
 
                 # Update phase after auto-advance
                 phase = flow.state.current_phase

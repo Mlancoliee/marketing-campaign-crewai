@@ -14,7 +14,6 @@ import PlanningView from "./components/views/PlanningView"
 import IntegrationView from "./components/views/IntegrationView"
 import ContentView from "./components/views/ContentView"
 import FinalizeView from "./components/views/FinalizeView"
-import DeployFAB from "./components/DeployFAB"
 import { exportCampaignMarkdown, downloadMarkdown } from "./utils/export"
 
 const PHASE_ORDER: Phase[] = ["start", "discovery", "planning", "integration", "content", "finalize"]
@@ -365,12 +364,30 @@ export default function App() {
       <Header
         locale={state.locale}
         onLocaleChange={handleLocaleChange}
-        onNew={handleNew}
-        onHistory={() => setHistoryOpen(true)}
       />
 
-      {state.phase !== "start" && (
-        <PhaseProgress phase={state.phase} progress={state.progress} />
+      {state.phase !== "start" ? (
+        <PhaseProgress
+          phase={state.phase}
+          progress={state.progress}
+          onNew={handleNew}
+          onHistory={() => setHistoryOpen(true)}
+        />
+      ) : (
+        <div className="flex justify-end px-6 py-2 gap-2">
+          <button onClick={handleNew} className="btn btn-ghost text-xs cursor-pointer px-2 py-1">
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+            </svg>
+            {t("app.new")}
+          </button>
+          <button onClick={() => setHistoryOpen(true)} className="btn btn-ghost text-xs cursor-pointer px-2 py-1">
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            {t("app.history")}
+          </button>
+        </div>
       )}
 
       {/* 全局 streaming 指示条 */}
@@ -403,7 +420,6 @@ export default function App() {
         onSelect={handleSelectHistory}
         currentId={state.conversationId}
       />
-      <DeployFAB />
     </div>
   )
 }

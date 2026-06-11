@@ -192,10 +192,9 @@ Branch operations (`redo_brand`, `redo_channel`, `rollback`) are intercepted by 
 
 ## Resources
 
-- [EdgeOne Makers Agents Documentation](https://pages.edgeone.ai/document/makers-agents) <!-- TODO: confirm slug -->
-- [Makers Quick Start](https://pages.edgeone.ai/document/makers-quick-start) <!-- TODO: confirm slug -->
-- [Makers Models](https://pages.edgeone.ai/document/makers-models) <!-- TODO: confirm slug -->
-- [CrewAI Documentation](https://docs.crewai.com)
+- [EdgeOne Makers Agents Documentation](https://pages.edgeone.ai/document/agents)
+- [Makers Quick Start](https://pages.edgeone.ai/document/agents-quick-start)
+- [Makers Models](https://pages.edgeone.ai/document/models)
 
 ## License
 

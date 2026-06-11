@@ -192,10 +192,9 @@ edgeone makers dev
 
 ## 相关资源
 
-- [EdgeOne Makers Agents 文档](https://pages.edgeone.ai/zh/document/makers-agents) <!-- TODO: confirm slug -->
-- [Makers 快速开始](https://pages.edgeone.ai/zh/document/makers-quick-start) <!-- TODO: confirm slug -->
-- [Makers Models](https://pages.edgeone.ai/zh/document/makers-models) <!-- TODO: confirm slug -->
-- [CrewAI 文档](https://docs.crewai.com)
+- [EdgeOne Makers Agents 文档](https://cloud.tencent.com/document/product/1552/132759)
+- [Makers 快速开始](https://cloud.tencent.com/document/product/1552/132786)
+- [Makers Models](https://cloud.tencent.com/document/product/1552/132748)
 
 ## 许可证
 

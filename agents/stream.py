@@ -203,8 +203,10 @@ async def handler(context):
         if pa_type == "confirm":
             user_message = user_message or "ACTION:confirm"
         elif pa_type == "keep_old":
-            # keep_old is a frontend-only action — return minimal SSE acknowledgment
+            # Restore old content to backend state so it's used for downstream phases
             async def _keep_old_gen2():
+                if pa_feedback and conversation_id:
+                    await _restore_old_content(conversation_id, pa_feedback, "", context.store)
                 yield context.utils.sse({"type": "done", "status": "completed"})
             return context.utils.stream_sse(_keep_old_gen2())
         elif pa_type == "rollback":
@@ -227,15 +229,25 @@ async def handler(context):
         ca_target = card_action.get("target", "")  # "brand" | "channel"
         ca_type = card_action.get("type", "")      # "confirm" | "redo" | "keep_old"
         ca_feedback = card_action.get("feedback", "")
+        # For keep_old, the old content is in previous_data.raw
+        ca_previous_raw = ""
+        if ca_type == "keep_old":
+            previous_data = card_action.get("previous_data", {})
+            if isinstance(previous_data, dict):
+                ca_previous_raw = previous_data.get("raw", "") or ""
 
         if ca_type == "redo" and ca_target:
             user_message = f"ACTION:redo_{ca_target}" + (f"|feedback={ca_feedback}" if ca_feedback else "")
         elif ca_type == "confirm":
             user_message = user_message or "ACTION:confirm"
         elif ca_type == "keep_old":
-            # keep_old is a frontend-only action — return minimal SSE acknowledgment
+            # Restore old content to backend state
+            old_content = ca_previous_raw or ca_feedback
             async def _keep_old_gen():
+                if old_content and conversation_id:
+                    await _restore_old_content_card(conversation_id, ca_target, old_content, context.store)
                 yield context.utils.sse({"type": "done", "status": "completed"})
+            return context.utils.stream_sse(_keep_old_gen())
             return context.utils.stream_sse(_keep_old_gen())
 
     # Handle skip_discovery (frontend "信息够了，开始策划" button)
@@ -457,7 +469,6 @@ async def handler(context):
             # ── Safety: if pending was lost (cleared by resume but step failed silently),
             # restore it so the session isn't lost on next request ──
             if is_resume and flow and not has_pending(cid):
-                log(f"[SAFETY] Pending lost after streaming — restoring for cid={cid} phase={flow.state.current_phase}")
                 from crewai.flow.async_feedback.types import PendingFeedbackContext
                 phase_to_method = {
                     "discovery": "discovery_step",
@@ -676,6 +687,49 @@ async def _handle_history(context, body):
 
 # ─── Utility functions ───────────────────────────────────────────────
 
+async def _restore_old_content_card(cid: str, target: str, old_content: str, store) -> None:
+    """Restore old content for a specific card (brand/channel) to persistence."""
+    persistence = get_persistence()
+
+    if not has_pending(cid):
+        await load_pending_from_store(cid, store)
+
+    pending = persistence.load_pending_feedback(cid)
+    if not pending:
+        return
+    state_data, ctx = pending
+
+    if target == "brand":
+        state_data["brand_creatives"] = old_content
+    elif target == "channel":
+        state_data["channel_plan"] = old_content
+
+    persistence.save_pending_feedback(cid, ctx, state_data)
+    await sync_pending_to_store(cid, store)
+
+
+async def _restore_old_content(cid: str, old_content: str, phase: str, store) -> None:
+    """Restore old content to persistence when user chooses 'keep old' in compare mode."""
+    persistence = get_persistence()
+
+    if not has_pending(cid):
+        await load_pending_from_store(cid, store)
+
+    pending = persistence.load_pending_feedback(cid)
+    if not pending:
+        return
+    state_data, ctx = pending
+
+    current_phase = state_data.get("current_phase", phase)
+    if current_phase == "integration":
+        state_data["integrated_strategy"] = old_content
+    elif current_phase == "content":
+        state_data["copywriting"] = old_content
+
+    persistence.save_pending_feedback(cid, ctx, state_data)
+    await sync_pending_to_store(cid, store)
+
+
 def _phase_progress(phase: str) -> int:
     return {
         "discovery": 10,
@@ -869,16 +923,11 @@ async def _save_conversation_metadata(cid: str, store, state) -> None:
     if state.audience_profile:
         cards["audience"] = {"content": state.audience_profile}
 
-    log(f"[META] saving metadata for cid={cid} phase={state.current_phase} cards_keys={list(cards.keys())}")
-
     try:
         # Ensure conversation exists before updating metadata
         try:
             await store.get_conversation(conversation_id=cid)
-            log(f"[META] conversation exists: {cid}")
-        except Exception as e:
-            log(f"[META] conversation not found ({e}), creating init message")
-            # Conversation doesn't exist yet — create it with an init message
+        except Exception:
             await store.append_message(
                 conversation_id=cid,
                 role="system",
@@ -893,9 +942,8 @@ async def _save_conversation_metadata(cid: str, store, state) -> None:
                 "campaign_name": getattr(state, "campaign_name", ""),
             },
         )
-        log(f"[META] metadata saved successfully for cid={cid}")
     except Exception as e:
-        log(f"[META] save conversation metadata FAILED: {e}")
+        log(f"save conversation metadata failed: {e}")
 
 
 def _normalize_agent(agent_role: str) -> str:

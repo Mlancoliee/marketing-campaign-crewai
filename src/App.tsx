@@ -14,6 +14,7 @@ import PlanningView from "./components/views/PlanningView"
 import IntegrationView from "./components/views/IntegrationView"
 import ContentView from "./components/views/ContentView"
 import FinalizeView from "./components/views/FinalizeView"
+import DeployFAB from "./components/DeployFAB"
 import { exportCampaignMarkdown, downloadMarkdown } from "./utils/export"
 
 const PHASE_ORDER: Phase[] = ["start", "discovery", "planning", "integration", "content", "finalize"]
@@ -182,7 +183,7 @@ function reducer(state: AppState, action: AppAction): AppState {
       return { ...state, streaming: false, statusMessage: state.statusMessage.startsWith("Error") ? state.statusMessage : "" }
 
     case "DONE":
-      return { ...state, streaming: false, statusMessage: "" }
+      return { ...state, streaming: false, statusMessage: state.statusMessage.startsWith("Error") ? state.statusMessage : "" }
 
     case "ERROR":
       return { ...state, streaming: false, statusMessage: `Error: ${action.message}` }
@@ -402,6 +403,7 @@ export default function App() {
         onSelect={handleSelectHistory}
         currentId={state.conversationId}
       />
+      <DeployFAB />
     </div>
   )
 }

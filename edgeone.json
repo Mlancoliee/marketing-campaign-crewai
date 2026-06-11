@@ -3,11 +3,7 @@
   "outputDirectory": "dist",
   "agents": {
     "framework": "crewai",
-    "dir": "agents",
-    "timeout": 300,
-    "sandbox": {
-      "timeout": 300
-    }
+    "dir": "agents"
   },
   "cloudFunctions": {
     "nodejs": {

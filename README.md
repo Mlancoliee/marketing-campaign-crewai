@@ -100,7 +100,7 @@ The dev server runs the Vite frontend, the CrewAI agent (`agents/stream.py`), an
 │   ├── i18n.ts                      # Internationalization (zh/en)
 │   ├── types/index.ts               # TypeScript type definitions
 │   └── utils/export.ts              # Markdown export utility
-├── edgeone.json                     # EdgeOne Pages configuration
+├── edgeone.json                     # EdgeOne Makers configuration
 ├── package.json                     # Frontend dependencies & scripts
 ├── requirements.txt                 # Python dependencies (crewai[litellm,tools])
 └── vite.config.ts                   # Vite + React + TailwindCSS config

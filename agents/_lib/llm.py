@@ -8,6 +8,8 @@ log = make_logger("llm")
 _llm = None
 _collapse_llm = None
 
+DEFAULT_MODEL = "openai/@makers/deepseek-v4-flash"
+
 
 def init_llm(context_env):
     """Initialize LLM singletons from context.env. Must be called once at handler start."""
@@ -21,9 +23,14 @@ def init_llm(context_env):
     if not api_key or not base_url:
         raise RuntimeError("Missing AI_GATEWAY_API_KEY or AI_GATEWAY_BASE_URL")
 
-    log("Initializing LLM...")
+    model = env.get("AI_GATEWAY_MODEL", "").strip() or DEFAULT_MODEL
+    # Ensure model has openai/ prefix for LiteLLM routing
+    if not model.startswith("openai/"):
+        model = f"openai/{model}"
+
+    log(f"Initializing LLM with model={model}")
     _llm = LLM(
-        model="openai/@makers/deepseek-v4-flash",
+        model=model,
         api_key=api_key,
         base_url=base_url,
         temperature=0.3,
@@ -31,7 +38,7 @@ def init_llm(context_env):
         stream=True,
     )
     _collapse_llm = LLM(
-        model="openai/@makers/deepseek-v4-flash",
+        model=model,
         api_key=api_key,
         base_url=base_url,
         temperature=0,
